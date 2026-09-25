@@ -1,0 +1,1512 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Prisma, type PrismaClient } from '@farmmitra/database';
+import { authenticate, hashPassword, HttpError, requirePermission, signAccessToken, verifyPassword } from './auth.js';
+import { audit } from './audit.js';
+import { pathParts, readJson, sendJson } from './http.js';
+import { addressSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema } from './schemas.js';
+import { DEFAULT_ORDER_CUTOFF, DEFAULT_ORDER_TIMEZONE, ORDER_STATUSES, calculateDeliveryDate, deriveDeliveryStatus, hashRequestPayload, isValidStatusTransition, orderSchema, parseRequestedDeliveryDate, quantityValidationError, type QuantityChange } from './orders.js';
+import { calculateAvailableQuantity, isReservationActionAllowed, parseDecimalQuantity } from './inventory.js';
+
+const body = async <T>(request: IncomingMessage, schema: { parse(value: unknown): T }): Promise<T> => {
+  try {
+    return schema.parse(await readJson(request));
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, error instanceof Error ? error.message : 'Invalid request');
+  }
+};
+
+const idFrom = (parts: string[], index: number): string => {
+  const value = parts[index];
+  if (!value) throw new HttpError(400, 'Resource id is required');
+  return value;
+};
+
+const publicUser = (user: { id: string; name: string; email: string | null; mobile: string | null; preferredLanguage: string; status: string; roles?: { role: { name: string } }[] }) => ({
+  id: user.id,
+  name: user.name,
+  email: user.email,
+  mobile: user.mobile,
+  preferredLanguage: user.preferredLanguage,
+  status: user.status,
+  roles: user.roles?.map(({ role }) => role.name) ?? [],
+});
+
+const authAndPermission = async (request: IncomingMessage, database: PrismaClient, permission: string) => {
+  const context = await authenticate(request, database);
+  requirePermission(context, permission);
+  return context;
+};
+
+const isAdminLike = (roles: string[]): boolean => roles.some((role) => ['SUPER_ADMIN', 'ADMIN', 'MANAGER'].includes(role));
+
+const ensureShopAccess = async (context: Awaited<ReturnType<typeof authenticate>>, database: PrismaClient, shopId: string): Promise<void> => {
+  if (isAdminLike(context.roles)) return;
+  const access = await database.shopUser.findUnique({ where: { userId_shopId: { userId: context.userId, shopId } } });
+  if (!access) throw new HttpError(403, 'Order is not accessible to this user');
+};
+
+const getIdempotencyKey = (request: IncomingMessage): string | undefined => {
+  const idemHeader = request.headers['idempotency-key'] ?? request.headers['Idempotency-Key'];
+  const key = typeof idemHeader === 'string' ? idemHeader.trim() : Array.isArray(idemHeader) ? idemHeader[0]?.trim() : undefined;
+  return key && key.length > 0 ? key : undefined;
+};
+
+const assertInventoryIdempotency = async (database: PrismaClient, request: IncomingMessage, context: Awaited<ReturnType<typeof authenticate>>, payload: unknown): Promise<undefined | { idempotent: true }> => {
+  const idempotencyKey = getIdempotencyKey(request);
+  if (!idempotencyKey) return undefined;
+  const requestHash = hashRequestPayload(payload);
+  const existingKey = await database.idempotencyKey.findUnique({ where: { key: idempotencyKey } });
+  if (!existingKey) {
+    await database.idempotencyKey.create({ data: { key: idempotencyKey, userId: context.userId, requestHash } });
+    return undefined;
+  }
+  if (existingKey.userId !== context.userId || existingKey.requestHash !== requestHash) {
+    throw new HttpError(409, 'Idempotency key was already used with a different request');
+  }
+  return { idempotent: true };
+};
+
+export const handleApi = async (request: IncomingMessage, response: ServerResponse, database: PrismaClient): Promise<boolean> => {
+  const parts = pathParts(request.url);
+  if (parts[0] !== 'api' || parts[1] !== 'v1') return false;
+  const method = request.method ?? 'GET';
+
+  if (parts[2] === 'auth') {
+    if (method === 'POST' && parts[3] === 'register') {
+      const input = await body(request, registerSchema);
+      if (!input.email && !input.mobile) throw new HttpError(400, 'Email or mobile is required');
+      const existing = await database.user.findFirst({ where: { OR: [{ email: input.email ?? undefined }, { mobile: input.mobile ?? undefined }] } });
+      if (existing) throw new HttpError(409, 'A user with that email or mobile already exists');
+      const role = await database.role.upsert({ where: { name: 'SHOP_OWNER' }, update: {}, create: { name: 'SHOP_OWNER' } });
+      const user = await database.user.create({ data: { name: input.name, email: input.email, mobile: input.mobile, preferredLanguage: input.preferredLanguage, passwordHash: await hashPassword(input.password), roles: { create: [{ roleId: role.id }] } }, include: { roles: { include: { role: true } } } });
+      await audit(database, user.id, 'CREATE', 'User', user.id);
+      const token = signAccessToken({ userId: user.id, roles: ['SHOP_OWNER'], permissions: [] });
+      sendJson(response, 201, { user: publicUser(user), accessToken: token });
+      return true;
+    }
+    if (method === 'POST' && parts[3] === 'login') {
+      const input = await body(request, loginSchema);
+      const user = await database.user.findFirst({ where: { OR: [{ email: input.identifier }, { mobile: input.identifier }] }, include: { roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } } } });
+      if (!user || user.status !== 'ACTIVE' || !(await verifyPassword(input.password, user.passwordHash))) throw new HttpError(401, 'Invalid credentials');
+      const roles = user.roles.map(({ role }) => role.name);
+      const permissions = user.roles.flatMap(({ role }) => role.permissions.map(({ permission }) => permission.name));
+      await audit(database, user.id, 'LOGIN', 'User', user.id);
+      sendJson(response, 200, { user: publicUser(user), accessToken: signAccessToken({ userId: user.id, roles, permissions }) });
+      return true;
+    }
+    if (method === 'GET' && parts[3] === 'me') {
+      const context = await authenticate(request, database);
+      const user = await database.user.findUnique({ where: { id: context.userId }, include: { roles: { include: { role: true } } } });
+      if (!user) throw new HttpError(404, 'User not found');
+      sendJson(response, 200, { user: publicUser(user), permissions: context.permissions });
+      return true;
+    }
+    throw new HttpError(404, 'Auth route not found');
+  }
+
+  if (parts[2] === 'users') {
+    if (method === 'GET' && parts.length === 3) {
+      await authAndPermission(request, database, 'users.read');
+      const users = await database.user.findMany({ orderBy: { createdAt: 'desc' }, include: { roles: { include: { role: true } } } });
+      sendJson(response, 200, users.map(publicUser));
+      return true;
+    }
+    if (method === 'POST' && parts.length === 3) {
+      const context = await authAndPermission(request, database, 'users.create');
+      const input = await body(request, userCreateSchema);
+      if (input.roleNames.includes('SUPER_ADMIN') && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Only a super admin can assign SUPER_ADMIN');
+      const roles = await database.role.findMany({ where: { name: { in: input.roleNames } } });
+      if (roles.length !== input.roleNames.length) throw new HttpError(400, 'One or more roles do not exist');
+      const user = await database.user.create({ data: { name: input.name, email: input.email, mobile: input.mobile, preferredLanguage: input.preferredLanguage, passwordHash: await hashPassword(input.password), roles: { create: roles.map((role) => ({ roleId: role.id })) } }, include: { roles: { include: { role: true } } } });
+      await audit(database, context.userId, 'CREATE', 'User', user.id);
+      sendJson(response, 201, publicUser(user));
+      return true;
+    }
+    if (parts.length >= 4) {
+      const userId = idFrom(parts, 3);
+      const context = await authenticate(request, database);
+      if (method === 'GET' && parts.length === 4) {
+        requirePermission(context, 'users.read');
+        const user = await database.user.findUnique({ where: { id: userId }, include: { roles: { include: { role: true } } } });
+        if (!user) throw new HttpError(404, 'User not found');
+        sendJson(response, 200, publicUser(user));
+        return true;
+      }
+      if (method === 'PATCH' && parts.length === 4) {
+        requirePermission(context, 'users.update');
+        const input = await body(request, userUpdateSchema);
+        const data = { ...input, passwordHash: input.password ? await hashPassword(input.password) : undefined };
+        delete (data as { password?: string }).password;
+        const user = await database.user.update({ where: { id: userId }, data, include: { roles: { include: { role: true } } } });
+        await audit(database, context.userId, 'UPDATE', 'User', userId);
+        sendJson(response, 200, publicUser(user));
+        return true;
+      }
+      if (method === 'POST' && parts[4] === 'roles') {
+        requirePermission(context, 'users.roles.assign');
+        const input = await body(request, roleSchema);
+        if (input.roleName === 'SUPER_ADMIN' && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Only a super admin can assign SUPER_ADMIN');
+        const role = await database.role.findUnique({ where: { name: input.roleName } });
+        if (!role) throw new HttpError(404, 'Role not found');
+        await database.userRole.upsert({ where: { userId_roleId: { userId, roleId: role.id } }, update: {}, create: { userId, roleId: role.id } });
+        await audit(database, context.userId, 'ASSIGN_ROLE', 'User', userId, { role: input.roleName });
+        sendJson(response, 204, null);
+        return true;
+      }
+      if (method === 'DELETE' && parts[4] === 'roles') {
+        requirePermission(context, 'users.roles.assign');
+        const input = await body(request, roleSchema);
+        const role = await database.role.findUnique({ where: { name: input.roleName } });
+        if (!role) throw new HttpError(404, 'Role not found');
+        await database.userRole.delete({ where: { userId_roleId: { userId, roleId: role.id } } });
+        await audit(database, context.userId, 'REMOVE_ROLE', 'User', userId, { role: input.roleName });
+        sendJson(response, 204, null);
+        return true;
+      }
+    }
+    throw new HttpError(404, 'User route not found');
+  }
+
+
+  if (parts[2] === 'farmers') {
+    if (method === 'GET' && parts.length === 3) {
+      await authAndPermission(request, database, 'farmers.read');
+
+      const farmers = await database.farmerProfile.findMany({
+        orderBy: { createdAt: 'desc' },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              mobile: true,
+              status: true,
+            },
+          },
+          farms: {
+            select: {
+              id: true,
+              name: true,
+              code: true,
+              type: true,
+              status: true,
+            },
+          },
+        },
+      });
+
+      sendJson(response, 200, farmers);
+      return true;
+    }
+
+    if (method === 'POST' && parts.length === 3) {
+      const context = await authAndPermission(request, database, 'farmers.create');
+      const input = await body(request, farmerCreateSchema);
+
+      const user = await database.user.findUnique({
+        where: { id: input.userId },
+      });
+
+      if (!user) {
+        throw new HttpError(404, 'User not found');
+      }
+
+      const existingFarmer = await database.farmerProfile.findFirst({
+        where: {
+          OR: [
+            { userId: input.userId },
+            { farmerCode: input.farmerCode },
+          ],
+        },
+      });
+
+      if (existingFarmer) {
+        if (existingFarmer.userId === input.userId) {
+          throw new HttpError(409, 'This user is already registered as a farmer');
+        }
+
+        throw new HttpError(409, 'Farmer code already exists');
+      }
+
+      const farmer = await database.farmerProfile.create({
+        data: input,
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              mobile: true,
+              status: true,
+            },
+          },
+          farms: true,
+        },
+      });
+
+      await audit(database, context.userId, 'CREATE', 'FarmerProfile', farmer.id);
+
+      sendJson(response, 201, farmer);
+      return true;
+    }
+
+    if (parts.length >= 4) {
+      const farmerId = idFrom(parts, 3);
+      const context = await authenticate(request, database);
+
+      if (method === 'GET' && parts.length === 4) {
+        requirePermission(context, 'farmers.read');
+
+        const farmer = await database.farmerProfile.findUnique({
+          where: { id: farmerId },
+          include: {
+            user: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                mobile: true,
+                status: true,
+              },
+            },
+            farms: {
+              orderBy: { createdAt: 'desc' },
+            },
+          },
+        });
+
+        if (!farmer) {
+          throw new HttpError(404, 'Farmer not found');
+        }
+
+        sendJson(response, 200, farmer);
+        return true;
+      }
+      if (method === 'PATCH' && parts.length === 4) {
+        requirePermission(context, 'farmers.update');
+
+        const input = await body(request, farmerUpdateSchema);
+
+        if (input.farmerCode) {
+          const existingCode = await database.farmerProfile.findFirst({
+            where: {
+              farmerCode: input.farmerCode,
+              NOT: { id: farmerId },
+            },
+          });
+
+          if (existingCode) {
+            throw new HttpError(409, 'Farmer code already exists');
+          }
+        }
+
+        let farmer;
+
+        try {
+          farmer = await database.farmerProfile.update({
+            where: { id: farmerId },
+            data: input,
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  email: true,
+                  mobile: true,
+                  status: true,
+                },
+              },
+              farms: true,
+            },
+          });
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('Record to update not found')) {
+            throw new HttpError(404, 'Farmer not found');
+          }
+
+          throw error;
+        }
+
+        await audit(database, context.userId, 'UPDATE', 'FarmerProfile', farmerId);
+
+        sendJson(response, 200, farmer);
+        return true;
+      }
+    }
+
+    throw new HttpError(404, 'Farmer route not found');
+  }
+  if (parts[2] === 'shops') {
+    if (method === 'GET' && parts.length === 3) {
+      await authAndPermission(request, database, 'shops.read');
+      sendJson(response, 200, await database.shop.findMany({ orderBy: { createdAt: 'desc' }, include: { contacts: true, addresses: true, creditAccount: true } }));
+      return true;
+    }
+    if (method === 'POST' && parts.length === 3) {
+      const context = await authAndPermission(request, database, 'shops.create');
+      const input = await body(request, shopSchema);
+      const shop = await database.shop.create({ data: input });
+      await audit(database, context.userId, 'CREATE', 'Shop', shop.id);
+      sendJson(response, 201, shop);
+      return true;
+    }
+    if (parts.length >= 4) {
+      const shopId = idFrom(parts, 3);
+      const context = await authenticate(request, database);
+      if (method === 'GET' && parts.length === 4) {
+        requirePermission(context, 'shops.read');
+        const shop = await database.shop.findUnique({ where: { id: shopId }, include: { contacts: true, addresses: true, creditAccount: true } });
+        if (!shop) throw new HttpError(404, 'Shop not found');
+        sendJson(response, 200, shop);
+        return true;
+      }
+      if (method === 'POST' && parts[4] === 'users') {
+        requirePermission(context, 'shops.update');
+        const input = await body(request, shopUserSchema);
+        const shop = await database.shop.findUnique({ where: { id: shopId } });
+        const user = await database.user.findUnique({ where: { id: input.userId } });
+        if (!shop || !user) throw new HttpError(404, 'Shop or user not found');
+        const assignment = await database.shopUser.upsert({ where: { userId_shopId: { userId: input.userId, shopId } }, update: {}, create: { userId: input.userId, shopId } });
+        await audit(database, context.userId, 'ASSIGN', 'ShopUser', `${input.userId}:${shopId}`);
+        sendJson(response, 201, assignment);
+        return true;
+      }
+      if (method === 'PATCH' && parts.length === 4) {
+        requirePermission(context, 'shops.update');
+        const shop = await database.shop.update({ where: { id: shopId }, data: await body(request, shopSchema) });
+        await audit(database, context.userId, 'UPDATE', 'Shop', shopId);
+        sendJson(response, 200, shop);
+        return true;
+      }
+      if (method === 'POST' && parts[4] === 'contacts') {
+        requirePermission(context, 'shops.update');
+        const contact = await database.shopContact.create({ data: { shopId, ...(await body(request, contactSchema)) } });
+        await audit(database, context.userId, 'CREATE', 'ShopContact', contact.id);
+        sendJson(response, 201, contact);
+        return true;
+      }
+      if (method === 'POST' && parts[4] === 'addresses') {
+        requirePermission(context, 'shops.update');
+        const address = await database.shopAddress.create({ data: { shopId, ...(await body(request, addressSchema)) } });
+        await audit(database, context.userId, 'CREATE', 'ShopAddress', address.id);
+        sendJson(response, 201, address);
+        return true;
+      }
+      if (method === 'PUT' && parts[4] === 'credit') {
+        requirePermission(context, 'shops.credit.manage');
+        const input = await body(request, creditSchema);
+        const credit = await database.shopCreditAccount.upsert({ where: { shopId }, update: input, create: { shopId, ...input } });
+        await audit(database, context.userId, 'UPSERT', 'ShopCreditAccount', credit.id);
+        sendJson(response, 200, credit);
+        return true;
+      }
+    }
+    throw new HttpError(404, 'Shop route not found');
+  }
+
+  if (parts[2] === 'catalog') {
+    const resource = parts[3];
+    const resourceName = resource ?? '';
+    const schemas: Record<string, { parse(value: unknown): unknown }> = { categories: categorySchema, units: unitSchema, products: productSchema, variants: variantSchema, prices: priceSchema };
+    const schema = schemas[resourceName];
+    if (!schema) throw new HttpError(404, 'Catalog route not found');
+    const permissionResource = resource === 'prices' ? 'catalog.prices' : `catalog.${resource}`;
+    if (method === 'GET' && parts.length === 4) {
+      await authAndPermission(request, database, `${permissionResource}.read`);
+      const delegate = { categories: database.category, units: database.unit, products: database.product, variants: database.productVariant, prices: database.productPrice }[resourceName as keyof typeof schemas];
+      sendJson(response, 200, await (delegate as { findMany(args?: unknown): Promise<unknown[]> }).findMany({ orderBy: { name: 'asc' } }));
+      return true;
+    }
+    if (method === 'POST' && parts.length === 4) {
+      const context = await authAndPermission(request, database, `${permissionResource}.create`);
+      const input = await body(request, schema);
+      const delegate = { categories: database.category, units: database.unit, products: database.product, variants: database.productVariant, prices: database.productPrice }[resourceName as keyof typeof schemas];
+      const record = await (delegate as { create(args: unknown): Promise<{ id: string }> }).create({ data: input });
+      await audit(database, context.userId, 'CREATE', resourceName, record.id);
+      sendJson(response, 201, record);
+      return true;
+    }
+    if (method === 'PATCH' && parts.length === 5) {
+      const context = await authAndPermission(request, database, `${permissionResource}.update`);
+      const recordId = idFrom(parts, 4);
+      const input = await body(request, schema);
+      const delegate = { categories: database.category, units: database.unit, products: database.product, variants: database.productVariant, prices: database.productPrice }[resourceName as keyof typeof schemas];
+      const record = await (delegate as { update(args: unknown): Promise<{ id: string }> }).update({ where: { id: recordId }, data: input });
+      await audit(database, context.userId, 'UPDATE', resourceName, recordId);
+      sendJson(response, 200, record);
+      return true;
+    }
+  }
+
+  if (parts[2] === 'warehouses') {
+    if (method === 'GET' && parts.length === 3) {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'warehouse.read');
+      const query = new URL(request.url ?? '/', 'http://localhost');
+      const where: Record<string, unknown> = {};
+      if (query.searchParams.get('branchId')) where.branchId = query.searchParams.get('branchId');
+      if (query.searchParams.get('isActive') !== null) where.isActive = query.searchParams.get('isActive') === 'true';
+      const warehouses = await database.warehouse.findMany({ where, include: { branch: true }, orderBy: { name: 'asc' } });
+      sendJson(response, 200, warehouses);
+      return true;
+    }
+
+    if (method === 'POST' && parts.length === 3) {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'warehouse.manage');
+      const input = await body(request, warehouseSchema);
+      const warehouse = await database.warehouse.create({ data: input, include: { branch: true } });
+      await audit(database, context.userId, 'CREATE', 'Warehouse', warehouse.id, { code: warehouse.code });
+      sendJson(response, 201, warehouse);
+      return true;
+    }
+
+    if (parts.length >= 4) {
+      const warehouseId = idFrom(parts, 3);
+      const context = await authenticate(request, database);
+
+      if (method === 'GET' && parts.length === 4) {
+        requirePermission(context, 'warehouse.read');
+        const warehouse = await database.warehouse.findUnique({ where: { id: warehouseId }, include: { branch: true } });
+        if (!warehouse) throw new HttpError(404, 'Warehouse not found');
+        sendJson(response, 200, warehouse);
+        return true;
+      }
+
+      if (method === 'PATCH' && parts.length === 4) {
+        requirePermission(context, 'warehouse.manage');
+        const input = await body(request, warehouseSchema.partial());
+        const warehouse = await database.warehouse.update({ where: { id: warehouseId }, data: input, include: { branch: true } });
+        await audit(database, context.userId, 'UPDATE', 'Warehouse', warehouseId, { code: warehouse.code });
+        sendJson(response, 200, warehouse);
+        return true;
+      }
+
+      if (method === 'GET' && parts[4] === 'inventory') {
+        requirePermission(context, 'inventory.read');
+        const inventory = await database.inventory.findMany({
+          where: { warehouseId },
+          include: {
+            warehouse: true,
+            variant: { include: { product: { include: { category: true, unit: true } }, unit: true } },
+          },
+          orderBy: { variantId: 'asc' },
+        });
+        sendJson(response, 200, inventory.map((item) => ({
+          ...item,
+          onHandQuantity: item.quantity,
+          reservedQuantity: item.reservedQuantity,
+          availableQuantity: calculateAvailableQuantity(item.quantity, item.reservedQuantity),
+        })));
+        return true;
+      }
+    }
+
+    throw new HttpError(404, 'Warehouse route not found');
+  }
+
+  if (parts[2] === 'inventory') {
+    if (method === 'GET' && parts.length === 3) {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.read');
+      const query = new URL(request.url ?? '/', 'http://localhost');
+      const where: Record<string, unknown> = {};
+      if (query.searchParams.get('warehouseId')) where.warehouseId = query.searchParams.get('warehouseId');
+      if (query.searchParams.get('variantId')) where.variantId = query.searchParams.get('variantId');
+      if (query.searchParams.get('productId')) {
+        where.variant = { is: { productId: query.searchParams.get('productId')! } };
+      }
+      if (query.searchParams.get('categoryId')) {
+        where.variant = { is: { product: { is: { categoryId: query.searchParams.get('categoryId')! } } } };
+      }
+      const inventory = await database.inventory.findMany({
+        where,
+        include: {
+          warehouse: true,
+          variant: { include: { product: { include: { category: true, unit: true } }, unit: true } },
+        },
+        orderBy: { warehouseId: 'asc' },
+      });
+      const lowStockOnly = query.searchParams.has('lowStock');
+      const filtered = inventory.filter((item) => {
+        const available = calculateAvailableQuantity(item.quantity, item.reservedQuantity);
+        if (!lowStockOnly) return true;
+        return available.lte(new Prisma.Decimal(query.searchParams.get('lowStock') ?? '0'));
+      });
+      const page = Math.max(1, Number(query.searchParams.get('page') ?? '1'));
+      const limit = Math.min(100, Math.max(1, Number(query.searchParams.get('limit') ?? '20')));
+      const paged = filtered.slice((page - 1) * limit, page * limit);
+      sendJson(response, 200, {
+        items: paged.map((item) => ({
+          ...item,
+          onHandQuantity: item.quantity,
+          reservedQuantity: item.reservedQuantity,
+          availableQuantity: calculateAvailableQuantity(item.quantity, item.reservedQuantity),
+        })),
+        pagination: {
+          page,
+          limit,
+          total: filtered.length,
+          totalPages: Math.ceil(filtered.length / limit),
+        },
+      });
+      return true;
+    }
+
+    if (method === 'GET' && parts[3] === 'variant' && parts.length === 5) {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.read');
+      const variantId = idFrom(parts, 4);
+      const inventory = await database.inventory.findMany({
+        where: { variantId },
+        include: { warehouse: true, variant: { include: { product: { include: { category: true, unit: true } }, unit: true } } },
+        orderBy: { quantity: 'desc' },
+      });
+      sendJson(response, 200, inventory.map((item) => ({
+        ...item,
+        onHandQuantity: item.quantity,
+        reservedQuantity: item.reservedQuantity,
+        availableQuantity: calculateAvailableQuantity(item.quantity, item.reservedQuantity),
+      })));
+      return true;
+    }
+
+    if (method === 'GET' && parts.length === 4 && parts[3] !== 'variant' && parts[3] !== 'transactions' && parts[3] !== 'receipts' && parts[3] !== 'issue' && parts[3] !== 'adjustments' && parts[3] !== 'transfer') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.read');
+      const inventoryId = idFrom(parts, 3);
+      const inventory = await database.inventory.findUnique({
+        where: { id: inventoryId },
+        include: { warehouse: true, variant: { include: { product: { include: { category: true, unit: true } }, unit: true } } },
+      });
+      if (!inventory) throw new HttpError(404, 'Inventory record not found');
+      sendJson(response, 200, {
+        ...inventory,
+        onHandQuantity: inventory.quantity,
+        reservedQuantity: inventory.reservedQuantity,
+        availableQuantity: calculateAvailableQuantity(inventory.quantity, inventory.reservedQuantity),
+      });
+      return true;
+    }
+
+    if (method === 'GET' && parts[3] === 'low-stock') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.read');
+      const inventory = await database.inventory.findMany({
+        include: { warehouse: true, variant: { include: { product: { include: { category: true, unit: true } }, unit: true } } },
+      });
+      const normalized = inventory.filter((item) => calculateAvailableQuantity(item.quantity, item.reservedQuantity).lte(new Prisma.Decimal(item.variant.product.minOrderQuantity ?? 0)) || item.quantity.lte(new Prisma.Decimal(item.variant.product.minOrderQuantity ?? 0)));
+      sendJson(response, 200, normalized.map((item) => ({
+        warehouse: item.warehouse,
+        product: item.variant.product,
+        variant: item.variant,
+        currentStock: item.quantity,
+        reserved: item.reservedQuantity,
+        available: calculateAvailableQuantity(item.quantity, item.reservedQuantity),
+        reorderLevel: item.variant.product.minOrderQuantity ?? new Prisma.Decimal(0),
+      })));
+      return true;
+    }
+
+    if (method === 'GET' && parts[3] === 'transactions') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.read');
+      const query = new URL(request.url ?? '/', 'http://localhost');
+      const where: Record<string, unknown> = {};
+      if (query.searchParams.get('warehouseId')) where.warehouseId = query.searchParams.get('warehouseId');
+      if (query.searchParams.get('variantId')) where.variantId = query.searchParams.get('variantId');
+      if (query.searchParams.get('referenceType')) where.referenceType = query.searchParams.get('referenceType');
+      if (query.searchParams.get('referenceId')) where.referenceId = query.searchParams.get('referenceId');
+      if (query.searchParams.get('type')) where.type = query.searchParams.get('type');
+      if (query.searchParams.get('dateFrom')) where.createdAt = { gte: new Date(query.searchParams.get('dateFrom')!) };
+      if (query.searchParams.get('dateTo')) {
+        const dateTo = new Date(query.searchParams.get('dateTo')!);
+        dateTo.setHours(23, 59, 59, 999);
+        where.createdAt = { ...((where.createdAt as Record<string, Date>) ?? {}), lte: dateTo };
+      }
+      const transactions = await database.inventoryTransaction.findMany({
+        where,
+        include: { warehouse: true },
+        orderBy: { createdAt: 'desc' },
+      });
+      sendJson(response, 200, transactions);
+      return true;
+    }
+
+    if (method === 'POST' && parts[3] === 'receipts') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.receive');
+      const input = await body(request, inventoryReceiptSchema);
+      const idem = await assertInventoryIdempotency(database, request, context, input);
+      if (idem) {
+        sendJson(response, 200, { idempotent: true, message: 'Receipt already processed' });
+        return true;
+      }
+      const quantity = parseDecimalQuantity(input.quantity, 'quantity');
+      const record = await database.$transaction(async (tx) => {
+        const warehouse = await tx.warehouse.findUnique({ where: { id: input.warehouseId } });
+        if (!warehouse) throw new HttpError(404, 'Warehouse not found');
+        const variant = await tx.productVariant.findUnique({ where: { id: input.variantId }, include: { product: true, unit: true } });
+        if (!variant) throw new HttpError(404, 'Variant not found');
+        const inventory = await tx.inventory.upsert({
+          where: { warehouseId_variantId: { warehouseId: input.warehouseId, variantId: input.variantId } },
+          update: { quantity: { increment: quantity } },
+          create: { warehouseId: input.warehouseId, variantId: input.variantId, quantity, reservedQuantity: new Prisma.Decimal(0) },
+          include: { warehouse: true, variant: { include: { product: { include: { category: true, unit: true } }, unit: true } } },
+        });
+        const transaction = await tx.inventoryTransaction.create({
+          data: {
+            warehouseId: input.warehouseId,
+            variantId: input.variantId,
+            type: 'PURCHASE',
+            quantity,
+            referenceType: input.referenceType ?? 'PURCHASE',
+            referenceId: input.referenceId ?? null,
+            notes: input.notes ?? 'Stock receipt',
+          },
+        });
+        await audit(tx as unknown as PrismaClient, context.userId, 'CREATE', 'InventoryTransaction', transaction.id, { warehouseId: input.warehouseId, variantId: input.variantId, type: 'PURCHASE', quantity: quantity.toString() });
+        return { inventory, transaction };
+      });
+      sendJson(response, 201, record);
+      return true;
+    }
+
+    if (method === 'POST' && parts[3] === 'issue') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.issue');
+      const input = await body(request, inventoryIssueSchema);
+      const idem = await assertInventoryIdempotency(database, request, context, input);
+      if (idem) {
+        sendJson(response, 200, { idempotent: true, message: 'Issue already processed' });
+        return true;
+      }
+      const quantity = parseDecimalQuantity(input.quantity, 'quantity');
+      const result = await database.$transaction(async (tx) => {
+        const inventory = await tx.inventory.findUnique({ where: { warehouseId_variantId: { warehouseId: input.warehouseId, variantId: input.variantId } } });
+        if (!inventory) throw new HttpError(404, 'Inventory record not found');
+        const available = calculateAvailableQuantity(inventory.quantity, inventory.reservedQuantity);
+        if (available.lt(quantity)) throw new HttpError(400, `Insufficient stock for variant ${input.variantId}. Requested: ${quantity.toString()}, available: ${available.toString()}`);
+        const updated = await tx.inventory.update({
+          where: { id: inventory.id },
+          data: { quantity: { decrement: quantity } },
+        });
+        const transaction = await tx.inventoryTransaction.create({ data: { warehouseId: input.warehouseId, variantId: input.variantId, type: 'SALE', quantity, referenceType: input.referenceType ?? 'ISSUE', referenceId: input.referenceId ?? null, notes: input.notes ?? 'Stock issue' } });
+        await audit(tx as unknown as PrismaClient, context.userId, 'UPDATE', 'Inventory', inventory.id, { warehouseId: input.warehouseId, variantId: input.variantId, type: 'SALE', beforeQuantity: inventory.quantity.toString(), afterQuantity: updated.quantity.toString(), quantity: quantity.toString() });
+        return { inventory: updated, transaction };
+      });
+      sendJson(response, 201, result);
+      return true;
+    }
+
+    if (method === 'POST' && parts[3] === 'adjustments') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.adjust');
+      const input = await body(request, inventoryAdjustmentSchema);
+      const idem = await assertInventoryIdempotency(database, request, context, input);
+      if (idem) {
+        sendJson(response, 200, { idempotent: true, message: 'Adjustment already processed' });
+        return true;
+      }
+      const quantity = parseDecimalQuantity(input.quantity, 'quantity');
+      const result = await database.$transaction(async (tx) => {
+        const inventory = await tx.inventory.findUnique({ where: { warehouseId_variantId: { warehouseId: input.warehouseId, variantId: input.variantId } } });
+        if (!inventory) throw new HttpError(404, 'Inventory record not found');
+        const beforeQuantity = inventory.quantity;
+        const afterQuantity = input.direction === 'INCREASE' ? beforeQuantity.plus(quantity) : beforeQuantity.minus(quantity);
+        if (afterQuantity.lt(0)) throw new HttpError(400, 'Adjustment would reduce stock below zero');
+        const updated = await tx.inventory.update({ where: { id: inventory.id }, data: { quantity: afterQuantity } });
+        const transaction = await tx.inventoryTransaction.create({ data: { warehouseId: input.warehouseId, variantId: input.variantId, type: 'ADJUSTMENT', quantity, referenceType: input.referenceType ?? 'ADJUSTMENT', referenceId: input.referenceId ?? null, notes: `${input.reason}${input.notes ? `: ${input.notes}` : ''}` } });
+        await audit(tx as unknown as PrismaClient, context.userId, 'UPDATE', 'Inventory', inventory.id, { warehouseId: input.warehouseId, variantId: input.variantId, beforeQuantity: beforeQuantity.toString(), afterQuantity: afterQuantity.toString(), reason: input.reason, direction: input.direction });
+        return { inventory: updated, transaction };
+      });
+      sendJson(response, 201, result);
+      return true;
+    }
+
+    if (method === 'POST' && parts[3] === 'transfer') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.transfer');
+      const input = await body(request, inventoryTransferSchema);
+      const idem = await assertInventoryIdempotency(database, request, context, input);
+      if (idem) {
+        sendJson(response, 200, { idempotent: true, message: 'Transfer already processed' });
+        return true;
+      }
+      const quantity = parseDecimalQuantity(input.quantity, 'quantity');
+      const result = await database.$transaction(async (tx) => {
+        if (input.fromWarehouseId === input.toWarehouseId) throw new HttpError(400, 'Transfer source and destination must differ');
+        const source = await tx.inventory.findUnique({ where: { warehouseId_variantId: { warehouseId: input.fromWarehouseId, variantId: input.variantId } } });
+        if (!source) throw new HttpError(404, 'Source inventory not found');
+        const available = calculateAvailableQuantity(source.quantity, source.reservedQuantity);
+        if (available.lt(quantity)) throw new HttpError(400, `Insufficient stock to transfer from warehouse ${input.fromWarehouseId}`);
+        const destination = await tx.inventory.upsert({
+          where: { warehouseId_variantId: { warehouseId: input.toWarehouseId, variantId: input.variantId } },
+          update: { quantity: { increment: quantity } },
+          create: { warehouseId: input.toWarehouseId, variantId: input.variantId, quantity, reservedQuantity: new Prisma.Decimal(0) },
+        });
+        const sourceUpdated = await tx.inventory.update({ where: { id: source.id }, data: { quantity: { decrement: quantity } } });
+        const sourceTx = await tx.inventoryTransaction.create({ data: { warehouseId: input.fromWarehouseId, variantId: input.variantId, type: 'RETURN_TRANSFER', quantity, referenceType: 'TRANSFER', referenceId: `transfer:${input.toWarehouseId}`, notes: input.notes ?? input.reason ?? 'Warehouse transfer' } });
+        const destTx = await tx.inventoryTransaction.create({ data: { warehouseId: input.toWarehouseId, variantId: input.variantId, type: 'RETURN_TRANSFER', quantity, referenceType: 'TRANSFER', referenceId: `transfer:${input.fromWarehouseId}`, notes: input.notes ?? input.reason ?? 'Warehouse transfer' } });
+        await audit(tx as unknown as PrismaClient, context.userId, 'TRANSFER', 'Inventory', source.id, { fromWarehouseId: input.fromWarehouseId, toWarehouseId: input.toWarehouseId, variantId: input.variantId, quantity: quantity.toString(), reason: input.reason ?? 'Warehouse transfer' });
+        return { source: sourceUpdated, destination, transactions: [sourceTx, destTx] };
+      });
+      sendJson(response, 201, result);
+      return true;
+    }
+
+    if (method === 'POST' && parts[3] === 'reservations') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'inventory.reserve');
+      const input = await body(request, { parse: (value: unknown) => ({ warehouseId: (value as { warehouseId: string }).warehouseId, variantId: (value as { variantId: string }).variantId, orderId: (value as { orderId: string }).orderId, quantity: parseDecimalQuantity((value as { quantity: number }).quantity, 'quantity') }) });
+      const idem = await assertInventoryIdempotency(database, request, context, input);
+      if (idem) {
+        sendJson(response, 200, { idempotent: true, message: 'Reservation already processed' });
+        return true;
+      }
+      const quantity = input.quantity;
+      const result = await database.$transaction(async (tx) => {
+        const inventory = await tx.inventory.findUnique({ where: { warehouseId_variantId: { warehouseId: input.warehouseId, variantId: input.variantId } } });
+        if (!inventory) throw new HttpError(404, 'Inventory record not found');
+        const available = calculateAvailableQuantity(inventory.quantity, inventory.reservedQuantity);
+        if (available.lt(quantity)) throw new HttpError(400, `Insufficient stock to reserve ${quantity.toString()} at warehouse ${input.warehouseId}`);
+        const order = await tx.order.findUnique({ where: { id: input.orderId } });
+        if (!order) throw new HttpError(404, 'Order not found');
+        const reservation = await tx.stockReservation.create({ data: { warehouseId: input.warehouseId, variantId: input.variantId, orderId: input.orderId, quantity, status: 'ACTIVE' } });
+        const updated = await tx.inventory.update({ where: { id: inventory.id }, data: { reservedQuantity: { increment: quantity } } });
+        const txRecord = await tx.inventoryTransaction.create({ data: { warehouseId: input.warehouseId, variantId: input.variantId, type: 'RESERVATION', quantity, referenceType: 'ORDER', referenceId: input.orderId, notes: 'Order reservation' } });
+        await audit(tx as unknown as PrismaClient, context.userId, 'CREATE', 'StockReservation', reservation.id, { orderId: input.orderId, warehouseId: input.warehouseId, variantId: input.variantId, quantity: quantity.toString() });
+        return { reservation, inventory: updated, transaction: txRecord };
+      });
+      sendJson(response, 201, result);
+      return true;
+    }
+
+    if (method === 'POST' && parts[3] === 'reservations' && parts.length >= 6) {
+      const reservationId = idFrom(parts, 4);
+      if (parts[5] === 'release') {
+        const context = await authenticate(request, database);
+        requirePermission(context, 'inventory.release');
+        const idem = await assertInventoryIdempotency(database, request, context, { reservationId, action: 'release' });
+        if (idem) {
+          sendJson(response, 200, { idempotent: true, message: 'Release already processed' });
+          return true;
+        }
+        const reservation = await database.stockReservation.findUnique({ where: { id: reservationId } });
+        if (!reservation) throw new HttpError(404, 'Reservation not found');
+        if (!isReservationActionAllowed(reservation.status, 'release')) throw new HttpError(409, 'Reservation cannot be released in its current state');
+        const result = await database.$transaction(async (tx) => {
+          const inventory = await tx.inventory.findUnique({ where: { warehouseId_variantId: { warehouseId: reservation.warehouseId, variantId: reservation.variantId } } });
+          if (!inventory) throw new HttpError(404, 'Inventory record not found');
+          const updated = await tx.inventory.update({ where: { id: inventory.id }, data: { reservedQuantity: { decrement: reservation.quantity } } });
+          const released = await tx.stockReservation.update({ where: { id: reservation.id }, data: { status: 'RELEASED', releasedAt: new Date() } });
+          const txRecord = await tx.inventoryTransaction.create({ data: { warehouseId: reservation.warehouseId, variantId: reservation.variantId, type: 'RELEASE', quantity: reservation.quantity, referenceType: 'RESERVATION', referenceId: reservation.id, notes: 'Reservation released' } });
+          await audit(tx as unknown as PrismaClient, context.userId, 'UPDATE', 'StockReservation', reservation.id, { action: 'release', warehouseId: reservation.warehouseId, variantId: reservation.variantId, quantity: reservation.quantity.toString() });
+          return { reservation: released, inventory: updated, transaction: txRecord };
+        });
+        sendJson(response, 200, result);
+        return true;
+      }
+
+      if (parts[5] === 'consume') {
+        const context = await authenticate(request, database);
+        requirePermission(context, 'inventory.issue');
+        const idem = await assertInventoryIdempotency(database, request, context, { reservationId, action: 'consume' });
+        if (idem) {
+          sendJson(response, 200, { idempotent: true, message: 'Consumption already processed' });
+          return true;
+        }
+        const reservation = await database.stockReservation.findUnique({ where: { id: reservationId } });
+        if (!reservation) throw new HttpError(404, 'Reservation not found');
+        if (!isReservationActionAllowed(reservation.status, 'consume')) throw new HttpError(409, 'Reservation cannot be consumed in its current state');
+        const result = await database.$transaction(async (tx) => {
+          const inventory = await tx.inventory.findUnique({ where: { warehouseId_variantId: { warehouseId: reservation.warehouseId, variantId: reservation.variantId } } });
+          if (!inventory) throw new HttpError(404, 'Inventory record not found');
+          const updated = await tx.inventory.update({ where: { id: inventory.id }, data: { quantity: { decrement: reservation.quantity }, reservedQuantity: { decrement: reservation.quantity } } });
+          const consumed = await tx.stockReservation.update({ where: { id: reservation.id }, data: { status: 'CONSUMED', releasedAt: new Date() } });
+          const txRecord = await tx.inventoryTransaction.create({ data: { warehouseId: reservation.warehouseId, variantId: reservation.variantId, type: 'SALE', quantity: reservation.quantity, referenceType: 'RESERVATION', referenceId: reservation.id, notes: 'Reservation consumed' } });
+          await audit(tx as unknown as PrismaClient, context.userId, 'UPDATE', 'StockReservation', reservation.id, { action: 'consume', warehouseId: reservation.warehouseId, variantId: reservation.variantId, quantity: reservation.quantity.toString() });
+          return { reservation: consumed, inventory: updated, transaction: txRecord };
+        });
+        sendJson(response, 200, result);
+        return true;
+      }
+    }
+
+    throw new HttpError(404, 'Inventory route not found');
+  }
+
+  if (parts[2] === 'orders') {
+    if (method === 'GET' && parts.length === 3) {
+      const context = await authenticate(request, database);
+      const query = new URL(request.url ?? '/', 'http://localhost');
+      const shopId = query.searchParams.get('shopId') ?? undefined;
+      if (!isAdminLike(context.roles)) {
+        if (!shopId) throw new HttpError(403, 'Shop id is required for shop-level order access');
+        await ensureShopAccess(context, database, shopId);
+      }
+      const where: Record<string, unknown> = shopId ? { shopId } : {};
+      if (query.searchParams.get('orderNumber')) where.orderNumber = { contains: query.searchParams.get('orderNumber')! };
+      if (query.searchParams.get('status')) where.status = query.searchParams.get('status') as never;
+      if (query.searchParams.get('shopId')) where.shopId = query.searchParams.get('shopId')!;
+      if (query.searchParams.get('deliveryDate')) {
+        const date = new Date(`${query.searchParams.get('deliveryDate')}T00:00:00.000Z`);
+        where.requestedDeliveryDate = { gte: date, lt: new Date(date.getTime() + 86400000) };
+      }
+      if (query.searchParams.get('orderDate')) {
+        const date = new Date(`${query.searchParams.get('orderDate')}T00:00:00.000Z`);
+        where.orderDate = { gte: date, lt: new Date(date.getTime() + 86400000) };
+      }
+      const page = Math.max(1, Number(query.searchParams.get('page') ?? '1'));
+      const pageSize = Math.min(100, Math.max(1, Number(query.searchParams.get('pageSize') ?? '20')));
+      const requestedSortField = query.searchParams.get('sortField') ?? 'createdAt';
+      const sortField = ['createdAt', 'orderDate', 'requestedDeliveryDate', 'status', 'orderNumber'].includes(requestedSortField) ? requestedSortField : 'createdAt';
+      const sortDirection = (query.searchParams.get('sortDirection') ?? 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
+      const orders = await database.order.findMany({
+        where,
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        orderBy: { [sortField]: sortDirection } as never,
+        include: { shop: { select: { id: true, name: true, ownerName: true, primaryMobile: true, whatsappNumber: true } }, items: true, statusHistory: { orderBy: { createdAt: 'desc' } } },
+      });
+      const total = await database.order.count({ where });
+      sendJson(response, 200, { items: orders, pagination: { page, pageSize, total, totalPages: Math.ceil(total / Math.max(pageSize, 1)) } });
+      return true;
+    }
+
+    if (method === 'GET' && parts[3] === 'packing-list') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'orders.read');
+      const query = new URL(request.url ?? '/', 'http://localhost');
+      const dateValue = query.searchParams.get('date');
+      if (!dateValue || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) throw new HttpError(400, 'date must be YYYY-MM-DD');
+      const start = new Date(`${dateValue}T00:00:00.000Z`);
+      const end = new Date(start.getTime() + 86400000);
+      const shopId = query.searchParams.get('shopId');
+      if (!isAdminLike(context.roles) && !shopId) throw new HttpError(403, 'Shop id is required for shop-level order access');
+      if (shopId) await ensureShopAccess(context, database, shopId);
+      const orders = await database.order.findMany({
+        where: { requestedDeliveryDate: { gte: start, lt: end }, ...(shopId ? { shopId } : {}) },
+        select: {
+          orderNumber: true,
+          status: true,
+          requestedDeliveryDate: true,
+          shop: { select: { name: true, primaryMobile: true, whatsappNumber: true } },
+          items: { select: { productNameSnapshot: true, variantNameSnapshot: true, skuSnapshot: true, unitSnapshot: true, orderedQuantity: true, packedQuantity: true } },
+        },
+        orderBy: { orderNumber: 'asc' },
+      });
+      sendJson(response, 200, orders.flatMap((order) => order.items.map((item) => ({
+        orderNumber: order.orderNumber,
+        shopName: order.shop.name,
+        shopPhone: order.shop.primaryMobile,
+        whatsappNumber: order.shop.whatsappNumber,
+        product: item.productNameSnapshot,
+        variant: item.variantNameSnapshot,
+        sku: item.skuSnapshot,
+        unit: item.unitSnapshot,
+        orderedQuantity: item.orderedQuantity,
+        packedQuantity: item.packedQuantity,
+        remainingQuantity: new Prisma.Decimal(item.orderedQuantity.toString()).minus(new Prisma.Decimal(item.packedQuantity.toString())),
+        deliveryDate: order.requestedDeliveryDate,
+        status: order.status,
+      }))));
+      return true;
+    }
+
+    if (method === 'GET' && parts[3] === 'daily-demand') {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'orders.read');
+      const query = new URL(request.url ?? '/', 'http://localhost');
+      const date = query.searchParams.get('date');
+      const targetDate = date ? new Date(`${date}T00:00:00.000Z`) : new Date();
+      const start = new Date(targetDate);
+      const end = new Date(targetDate);
+      end.setDate(end.getDate() + 1);
+      const shopId = query.searchParams.get('shopId');
+      if (!isAdminLike(context.roles) && !shopId) throw new HttpError(403, 'Shop id is required for shop-level order access');
+      if (shopId) await ensureShopAccess(context, database, shopId);
+      const orders = await database.order.findMany({
+        where: { requestedDeliveryDate: { gte: start, lt: end }, ...(shopId ? { shopId } : {}) },
+        select: { status: true, items: { select: { productId: true, variantId: true, productNameSnapshot: true, variantNameSnapshot: true, unitSnapshot: true, orderedQuantity: true, packedQuantity: true, deliveredQuantity: true } } },
+      });
+      const aggregates = new Map<string, { product: string | null; variant: string | null; unit: string | null; orderedQuantity: Prisma.Decimal; confirmedQuantity: Prisma.Decimal; packedQuantity: Prisma.Decimal; deliveredQuantity: Prisma.Decimal }>();
+      for (const order of orders) {
+        for (const item of order.items) {
+          const key = `${item.productId}:${item.variantId ?? 'none'}`;
+          const existing = aggregates.get(key) ?? { product: item.productNameSnapshot, variant: item.variantNameSnapshot, unit: item.unitSnapshot, orderedQuantity: new Prisma.Decimal(0), confirmedQuantity: new Prisma.Decimal(0), packedQuantity: new Prisma.Decimal(0), deliveredQuantity: new Prisma.Decimal(0) };
+          existing.orderedQuantity = existing.orderedQuantity.plus(item.orderedQuantity);
+          if (['CONFIRMED', 'PICKING', 'PACKED', 'ASSIGNED', 'OUT_FOR_DELIVERY', 'PARTIALLY_DELIVERED', 'DELIVERED'].includes(order.status)) existing.confirmedQuantity = existing.confirmedQuantity.plus(item.orderedQuantity);
+          existing.packedQuantity = existing.packedQuantity.plus(item.packedQuantity);
+          existing.deliveredQuantity = existing.deliveredQuantity.plus(item.deliveredQuantity);
+          aggregates.set(key, existing);
+        }
+      }
+      sendJson(response, 200, Array.from(aggregates.values()).map((item) => ({ ...item, remainingQuantity: item.orderedQuantity.minus(item.deliveredQuantity) })));
+      return true;
+    }
+
+    if (method === 'POST' && parts.length === 3) {
+      const context = await authenticate(request, database);
+      requirePermission(context, 'orders.create');
+      const input = await body(request, orderSchema);
+      const idemHeader = request.headers['idempotency-key'] ?? request.headers['Idempotency-Key'];
+      const idempotencyKey = typeof idemHeader === 'string' ? idemHeader.trim() : Array.isArray(idemHeader) ? idemHeader[0]?.trim() : undefined;
+      const requestHash = hashRequestPayload(input);
+      if (idempotencyKey) {
+        const existingKey = await database.idempotencyKey.findUnique({ where: { key: idempotencyKey }, include: { order: { include: { items: true, statusHistory: true } } } });
+        if (existingKey) {
+          if (existingKey.userId !== context.userId || existingKey.requestHash !== requestHash) throw new HttpError(409, 'Idempotency key was already used with a different request');
+          if (!existingKey.order) throw new HttpError(409, 'A request with this idempotency key is already in progress');
+          sendJson(response, 200, { idempotent: true, order: existingKey.order });
+          return true;
+        }
+      }
+      const shopId = input.shopId ?? undefined;
+      if (!shopId) throw new HttpError(400, 'Shop id is required');
+      if (!isAdminLike(context.roles) && shopId !== (await database.shop.findFirst({ where: { id: shopId }, select: { id: true } }))?.id) {
+        throw new HttpError(403, 'Order is not accessible to this user');
+      }
+      const shop = await database.shop.findUnique({ where: { id: shopId }, include: { addresses: true } });
+      if (!shop) throw new HttpError(404, 'Shop not found');
+      if (!shop.isActive) throw new HttpError(400, 'Shop is inactive');
+      if (input.deliveryAddressId) {
+        const address = await database.shopAddress.findFirst({ where: { id: input.deliveryAddressId, shopId } });
+        if (!address) throw new HttpError(404, 'Delivery address not found');
+      }
+      const cutoffSetting = await database.setting.findFirst({ where: { key: 'order.cutoff.time' } });
+      const cutoffTime = (cutoffSetting?.value as string | undefined) ?? DEFAULT_ORDER_CUTOFF;
+      const timezoneSetting = await database.setting.findFirst({ where: { key: 'order.timezone' } });
+      const timezone = (timezoneSetting?.value as string | undefined) ?? DEFAULT_ORDER_TIMEZONE;
+      const effectiveDeliveryDate = calculateDeliveryDate(new Date(), cutoffTime, timezone);
+      const orderDate = new Date();
+      const itemRows: Array<{ productId: string; variantId?: string; unitId: string; productNameSnapshot: string; variantNameSnapshot: string | null; skuSnapshot: string | null; unitSnapshot: string | null; orderedQuantity: number; unitPrice: number; taxRate: number; taxAmount: number; lineTotal: number; notes?: string; }> = [];
+      let subtotal = 0;
+      for (const item of input.items) {
+        const product = await database.product.findUnique({ where: { id: item.productId }, include: { unit: true, variants: true } });
+        if (!product) throw new HttpError(404, `Product not found: ${item.productId}`);
+        if (product.status !== 'ACTIVE') throw new HttpError(400, `Product is inactive: ${product.name}`);
+        const variant = item.variantId ? await database.productVariant.findUnique({ where: { id: item.variantId }, include: { unit: true } }) : null;
+        if (item.variantId && !variant) throw new HttpError(404, 'Variant not found');
+        if (variant && variant.status !== 'ACTIVE') throw new HttpError(400, 'Variant is inactive');
+        const priceRecord = await database.productPrice.findFirst({
+          where: {
+            OR: [
+              { variantId: item.variantId ?? undefined, shopId },
+              { productId: item.productId, shopId },
+              { variantId: item.variantId ?? undefined, shopId: null },
+              { productId: item.productId, shopId: null },
+            ],
+          },
+          orderBy: { validFrom: 'desc' },
+        });
+        if (!priceRecord) throw new HttpError(400, 'Pricing is not available for the selected product');
+        const priceValue = Number(priceRecord.price);
+        const quantity = Number(item.quantity);
+        const lineTotal = priceValue * quantity;
+        const taxRate = 0;
+        const taxAmount = 0;
+        subtotal += lineTotal;
+        itemRows.push({
+          productId: item.productId,
+          variantId: item.variantId,
+          unitId: item.unitId ?? (variant?.unitId ?? product.unitId),
+          productNameSnapshot: product.name,
+          variantNameSnapshot: variant?.name ?? product.name,
+          skuSnapshot: variant?.sku ?? product.sku,
+          unitSnapshot: variant?.unit?.code ?? product.unit.code,
+          orderedQuantity: quantity,
+          unitPrice: priceValue,
+          taxRate,
+          taxAmount,
+          lineTotal,
+          notes: item.notes,
+        });
+      }
+      if (idempotencyKey) {
+        try {
+          await database.idempotencyKey.create({ data: { key: idempotencyKey, userId: context.userId, requestHash } });
+        } catch (error) {
+          if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
+          const concurrentKey = await database.idempotencyKey.findUnique({ where: { key: idempotencyKey }, include: { order: { include: { items: true, statusHistory: true } } } });
+          if (!concurrentKey || concurrentKey.userId !== context.userId || concurrentKey.requestHash !== requestHash || !concurrentKey.order) throw new HttpError(409, 'A request with this idempotency key is already in progress or conflicts');
+          sendJson(response, 200, { idempotent: true, order: concurrentKey.order });
+          return true;
+        }
+      }
+      const orderNumber = `FM-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString().slice(2, 8)}`;
+      const defaultWarehouse = await database.warehouse.findFirst({
+        where: { isActive: true },
+        orderBy: { code: 'asc' },
+        select: { branchId: true },
+      });
+      if (!defaultWarehouse) throw new HttpError(400, 'No active warehouse is configured');
+      const branchId = defaultWarehouse.branchId;
+      let order;
+      try {
+        order = await database.$transaction(async (tx) => {
+        const createdOrder = await tx.order.create({
+          data: {
+            orderNumber,
+            shopId,
+            branchId,
+            status: 'DRAFT',
+            orderDate,
+            requestedDeliveryDate: effectiveDeliveryDate,
+            deliveryAddressId: input.deliveryAddressId ?? null,
+            subtotal: subtotal,
+            taxAmount: 0,
+            totalAmount: subtotal,
+            notes: input.notes ?? null,
+            customerNotes: input.customerNotes ?? null,
+            internalNotes: input.internalNotes ?? null,
+            items: { create: itemRows },
+            statusHistory: { create: [{ newStatus: 'DRAFT', changedBy: context.userId, reason: 'CREATED', notes: 'Order created as draft' }] },
+          },
+          include: { items: true, statusHistory: true },
+        });
+        if (idempotencyKey) await tx.idempotencyKey.update({ where: { key: idempotencyKey }, data: { orderId: createdOrder.id } });
+        return createdOrder;
+        });
+      } catch (error) {
+        if (idempotencyKey) await database.idempotencyKey.deleteMany({ where: { key: idempotencyKey, orderId: null } });
+        throw error;
+      }
+      if (!order) throw new HttpError(500, 'Failed to create order');
+      await audit(database, context.userId, 'CREATE', 'Order', order.id, { orderNumber: order.orderNumber });
+      sendJson(response, 201, order);
+      return true;
+    }
+
+    if (parts.length >= 4) {
+      const orderId = idFrom(parts, 3);
+      const context = await authenticate(request, database);
+      const order = await database.order.findUnique({
+        where: { id: orderId },
+        include: {
+          items: true,
+          shop: { select: { id: true, name: true, ownerName: true, primaryMobile: true, whatsappNumber: true } },
+          deliveries: { include: { deliveredBy: { select: { id: true, name: true } }, assignments: { include: { user: { select: { id: true, name: true } } } }, items: true }, orderBy: { createdAt: 'asc' } },
+          payments: { select: { id: true, amount: true, method: true, status: true, referenceNumber: true, paidAt: true, receivedAt: true, receivedBy: { select: { id: true, name: true } }, notes: true } },
+        },
+      });
+      if (!order) throw new HttpError(404, 'Order not found');
+      await ensureShopAccess(context, database, order.shopId);
+
+      if (method === 'PATCH' && parts[4] === 'items' && parts.length === 7) {
+        const itemId = idFrom(parts, 5);
+        const action = parts[6];
+        if (action !== 'packed-quantity' && action !== 'delivered-quantity' && action !== 'returned-quantity') throw new HttpError(404, 'Quantity route not found');
+        const contextPermission = action === 'delivered-quantity' || action === 'returned-quantity' ? 'orders.update' : 'orders.update';
+        requirePermission(context, contextPermission);
+        const input = await body(request, quantitySchema);
+        const updated = await database.$transaction(async (tx) => {
+          const currentOrder = await tx.order.findUnique({ where: { id: orderId }, include: { items: true } });
+          const item = currentOrder?.items.find((candidate) => candidate.id === itemId);
+          if (!currentOrder || !item) throw new HttpError(404, 'Order item not found');
+          const quantity = new Prisma.Decimal(input.quantity);
+          const ordered = new Prisma.Decimal(item.orderedQuantity);
+          const packed = new Prisma.Decimal(item.packedQuantity);
+          const delivered = new Prisma.Decimal(item.deliveredQuantity);
+          const quantityError = quantityValidationError(action as QuantityChange, quantity, ordered, packed, delivered);
+          if (quantityError) throw new HttpError(400, quantityError);
+          if (action === 'delivered-quantity') {
+            if (!['OUT_FOR_DELIVERY', 'PARTIALLY_DELIVERED'].includes(currentOrder.status)) throw new HttpError(400, 'Order is not in a deliverable status');
+          }
+          const data = action === 'packed-quantity' ? { packedQuantity: quantity } : action === 'delivered-quantity' ? { deliveredQuantity: quantity } : { returnedQuantity: quantity };
+          const updatedItem = await tx.orderItem.update({ where: { id: itemId }, data });
+          let status = currentOrder.status;
+          if (action === 'packed-quantity') {
+            const allPacked = currentOrder.items.every((candidate) => candidate.id === itemId ? quantity.gte(candidate.orderedQuantity) : new Prisma.Decimal(candidate.packedQuantity).gte(candidate.orderedQuantity));
+            if (allPacked && currentOrder.status === 'PICKING') status = 'PACKED';
+          }
+          if (action === 'delivered-quantity') {
+            status = deriveDeliveryStatus(currentOrder.status, currentOrder.items.map((candidate) => ({ orderedQuantity: new Prisma.Decimal(candidate.orderedQuantity), deliveredQuantity: candidate.id === itemId ? quantity : new Prisma.Decimal(candidate.deliveredQuantity) })));
+          }
+          if (status !== currentOrder.status && !isValidStatusTransition(currentOrder.status, status)) throw new HttpError(400, 'Invalid status transition');
+          const updatedOrder = status === currentOrder.status ? currentOrder : await tx.order.update({ where: { id: orderId }, data: { status, ...(status === 'DELIVERED' ? { deliveredAt: new Date() } : {}), statusHistory: { create: [{ previousStatus: currentOrder.status, newStatus: status, changedBy: context.userId, reason: action.toUpperCase(), notes: 'Order quantity updated' }] } } });
+          if (action === 'delivered-quantity') {
+            const delivery = await tx.delivery.findFirst({ where: { orderId }, orderBy: { createdAt: 'desc' } });
+            if (!delivery) throw new HttpError(409, 'A delivery event must be assigned before recording delivery quantity');
+            await tx.delivery.update({
+              where: { id: delivery.id },
+              data: {
+                status: status === 'DELIVERED' ? 'DELIVERED' : 'PARTIALLY_DELIVERED',
+                deliveredByUserId: context.userId,
+                deliveredAt: status === 'DELIVERED' ? new Date() : delivery.deliveredAt,
+                deliveryNotes: input.notes ?? delivery.deliveryNotes,
+              },
+            });
+          }
+          return { item: updatedItem, order: updatedOrder, statusChanged: status !== currentOrder.status };
+        });
+        await audit(database, context.userId, 'UPDATE', 'OrderItem', itemId, { action, quantity: input.quantity, status: updated.statusChanged ? updated.order.status : undefined });
+        sendJson(response, 200, updated);
+        return true;
+      }
+
+      if (method === 'POST' && parts[4] === 'assignment' && parts.length === 5) {
+        requirePermission(context, 'orders.place');
+        const input = await body(request, assignmentSchema);
+        const assignee = await database.user.findUnique({ where: { id: input.userId }, include: { roles: { include: { role: true } } } });
+        if (!assignee || assignee.status !== 'ACTIVE' || !assignee.roles.some(({ role }) => role.name === 'DELIVERY_STAFF')) throw new HttpError(400, 'Active delivery staff user is required');
+        const address = order.deliveryAddressId ? await database.shopAddress.findUnique({ where: { id: order.deliveryAddressId } }) : null;
+        const assigned = await database.$transaction(async (tx) => {
+          const delivery = await tx.delivery.create({ data: { orderId, shopId: order.shopId, deliveryAddress: address ? `${address.line1}, ${address.city}, ${address.state} ${address.postalCode}` : 'Address not specified', scheduledAt: input.deliveryDate ?? order.requestedDeliveryDate } });
+          const assignment = await tx.deliveryAssignment.create({ data: { deliveryId: delivery.id, userId: input.userId, status: input.status ?? 'ASSIGNED' } });
+          const updatedOrder = await tx.order.update({ where: { id: orderId }, data: { assignedAt: new Date(), status: order.status === 'PACKED' ? 'ASSIGNED' : order.status, ...(order.status === 'PACKED' ? { statusHistory: { create: [{ previousStatus: order.status, newStatus: 'ASSIGNED', changedBy: context.userId, reason: 'ASSIGN_DELIVERY', notes: 'Delivery staff assigned' }] } } : {}) } });
+          return { delivery, assignment, order: updatedOrder };
+        });
+        await audit(database, context.userId, 'ASSIGN', 'Delivery', assigned.delivery.id, { orderId, userId: input.userId });
+        sendJson(response, 201, assigned);
+        return true;
+      }
+
+      if (method === 'GET' && parts.length === 4) {
+        requirePermission(context, 'orders.read');
+        const receivedAmount = order.payments.filter((payment) => payment.status === 'COMPLETED').reduce((total, payment) => total.plus(payment.amount), new Prisma.Decimal(0));
+        sendJson(response, 200, {
+          ...order,
+          delivery: order.deliveries,
+          payment: {
+            status: receivedAmount.gte(order.totalAmount) ? 'PAID' : 'PENDING',
+            amountReceived: receivedAmount,
+            outstandingAmount: new Prisma.Decimal(order.totalAmount).minus(receivedAmount).greaterThan(0) ? new Prisma.Decimal(order.totalAmount).minus(receivedAmount) : new Prisma.Decimal(0),
+            records: order.payments,
+          },
+        });
+        return true;
+      }
+
+      if (method === 'POST' && parts[4] === 'confirm' && parts.length === 5) {
+
+
+        requirePermission(context, 'orders.update');
+
+
+
+        if (order.status !== 'PLACED') {
+
+
+          throw new HttpError(400, 'Only placed orders can be confirmed');
+
+
+        }
+
+
+
+        const newStatus = 'CONFIRMED';
+
+
+
+        if (!isValidStatusTransition(order.status, newStatus)) {
+
+
+          throw new HttpError(400, 'Invalid status transition');
+
+
+        }
+
+
+
+        const updated = await database.order.update({
+
+
+          where: { id: orderId },
+
+
+          data: {
+
+
+            status: newStatus,
+
+
+            statusHistory: {
+
+
+              create: [{
+
+
+                previousStatus: order.status,
+
+
+                newStatus,
+
+
+                changedBy: context.userId,
+
+
+                reason: 'CONFIRM_ORDER',
+
+
+                notes: 'Order confirmed by shop or admin',
+
+
+              }],
+
+
+            },
+
+
+          },
+
+
+          include: {
+
+
+            items: true,
+
+
+            statusHistory: true,
+
+
+          },
+
+
+        });
+
+
+
+        await audit(database, context.userId, 'UPDATE', 'Order', orderId, {
+
+
+          status: newStatus,
+
+
+        });
+
+
+
+        sendJson(response, 200, updated);
+
+
+        return true;
+
+
+      }
+
+
+
+      if (method === 'POST' && parts[4] === 'start-picking' && parts.length === 5) {
+
+
+        requirePermission(context, 'orders.update');
+
+
+
+        if (order.status !== 'CONFIRMED') {
+
+
+          throw new HttpError(400, 'Only confirmed orders can start picking');
+
+
+        }
+
+
+
+        const newStatus = 'PICKING';
+
+
+
+        if (!isValidStatusTransition(order.status, newStatus)) {
+
+
+          throw new HttpError(400, 'Invalid status transition');
+
+
+        }
+
+
+
+        const updated = await database.order.update({
+
+
+          where: { id: orderId },
+
+
+          data: {
+
+
+            status: newStatus,
+
+
+            statusHistory: {
+
+
+              create: [{
+
+
+                previousStatus: order.status,
+
+
+                newStatus,
+
+
+                changedBy: context.userId,
+
+
+                reason: 'START_PICKING',
+
+
+                notes: 'Order picking started',
+
+
+              }],
+
+
+            },
+
+
+          },
+
+
+          include: {
+
+
+            items: true,
+
+
+            statusHistory: true,
+
+
+          },
+
+
+        });
+
+
+
+        await audit(database, context.userId, 'UPDATE', 'Order', orderId, {
+
+
+          status: newStatus,
+
+
+        });
+
+
+
+        sendJson(response, 200, updated);
+
+
+        return true;
+
+
+      }
+
+
+
+      if (method === 'POST' && parts[4] === 'place') {
+        requirePermission(context, 'orders.update');
+        if (order.status !== 'DRAFT' && order.status !== 'PLACED') {
+          throw new HttpError(400, 'Order cannot be placed in its current status');
+        }
+        const newStatus = 'PLACED';
+        if (!isValidStatusTransition(order.status, newStatus)) {
+          throw new HttpError(400, 'Invalid status transition');
+        }
+        const updated = await database.order.update({
+          where: { id: orderId },
+          data: { status: newStatus, placedAt: new Date(), totalAmount: order.totalAmount, statusHistory: { create: [{ previousStatus: order.status, newStatus, changedBy: context.userId, reason: 'PLACE_ORDER', notes: 'Order placed by shop or admin' }] } },
+          include: { items: true, statusHistory: true },
+        });
+        await audit(database, context.userId, 'UPDATE', 'Order', orderId, { status: newStatus });
+        sendJson(response, 200, updated);
+        return true;
+      }
+
+      if (method === 'POST' && parts[4] === 'cancel') {
+        requirePermission(context, 'orders.cancel');
+        if (order.status === 'CANCELLED') throw new HttpError(400, 'Order already cancelled');
+        const newStatus = 'CANCELLED';
+        if (!isValidStatusTransition(order.status, newStatus)) {
+          throw new HttpError(400, 'Order cannot be cancelled in its current status');
+        }
+        const updated = await database.order.update({
+          where: { id: orderId },
+          data: { status: newStatus, cancelledAt: new Date(), cancellationReason: 'Cancelled by request', statusHistory: { create: [{ previousStatus: order.status, newStatus, changedBy: context.userId, reason: 'CANCEL_ORDER', notes: 'Order cancelled' }] } },
+          include: { items: true, statusHistory: true },
+        });
+        await audit(database, context.userId, 'UPDATE', 'Order', orderId, { status: newStatus });
+        sendJson(response, 200, updated);
+        return true;
+      }
+
+      if (method === 'GET' && parts[4] === 'status-history') {
+        requirePermission(context, 'orders.read');
+        const history = await database.orderStatusHistory.findMany({ where: { orderId }, orderBy: { createdAt: 'desc' } });
+        sendJson(response, 200, history);
+        return true;
+      }
+
+      if (method === 'POST' && parts[4] === 'reorder') {
+        requirePermission(context, 'orders.reorder');
+        const warnings: string[] = [];
+        const reorderedItems: Array<{ productId: string; variantId?: string; unitId: string; productNameSnapshot: string; variantNameSnapshot: string | null; skuSnapshot: string | null; unitSnapshot: string | null; orderedQuantity: number; unitPrice: number; lineTotal: number; taxRate: number; taxAmount: number; notes: string | null }> = [];
+        let subtotal = 0;
+        for (const item of order.items) {
+          const product = await database.product.findUnique({ where: { id: item.productId }, include: { unit: true, variants: true } });
+          const variant = item.variantId ? await database.productVariant.findUnique({ where: { id: item.variantId }, include: { unit: true } }) : null;
+          if (!product || product.status !== 'ACTIVE') { warnings.push(`Skipped inactive product: ${item.productId}`); continue; }
+          if (item.variantId && variant && variant.status !== 'ACTIVE') { warnings.push(`Skipped inactive variant: ${item.variantId}`); continue; }
+          const priceRecord = await database.productPrice.findFirst({
+            where: {
+              OR: [
+                { variantId: item.variantId ?? undefined, shopId: order.shopId },
+                { productId: item.productId, shopId: order.shopId },
+                { variantId: item.variantId ?? undefined, shopId: null },
+                { productId: item.productId, shopId: null },
+              ],
+            },
+            orderBy: { validFrom: 'desc' },
+          });
+          if (!priceRecord) { warnings.push(`No current price available for ${product.name}`); continue; }
+          const q = Number(item.orderedQuantity);
+          const price = Number(priceRecord.price);
+          const lineTotal = price * q;
+          subtotal += lineTotal;
+          reorderedItems.push({
+            productId: item.productId,
+            variantId: item.variantId ?? undefined,
+            unitId: item.unitId,
+            productNameSnapshot: product.name,
+            variantNameSnapshot: variant?.name ?? product.name,
+            skuSnapshot: variant?.sku ?? product.sku,
+            unitSnapshot: variant?.unit?.code ?? product.unit.code,
+            orderedQuantity: q,
+            unitPrice: price,
+            lineTotal,
+            taxRate: 0,
+            taxAmount: 0,
+            notes: item.notes,
+          });
+        }
+        const created = await database.order.create({
+          data: {
+            orderNumber: `FM-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString().slice(2, 8)}`,
+            shopId: order.shopId,
+            status: 'DRAFT',
+            orderDate: new Date(),
+            requestedDeliveryDate: new Date(),
+            subtotal,
+            taxAmount: 0,
+            totalAmount: subtotal,
+            items: { create: reorderedItems.map((item) => ({ ...item, orderedQuantity: item.orderedQuantity, unitId: item.unitId })) },
+            statusHistory: { create: [{ newStatus: 'DRAFT', changedBy: context.userId, reason: 'REORDER', notes: 'Order recreated from previous order' }] },
+          },
+          include: { items: true, statusHistory: true },
+        });
+        sendJson(response, 201, { order: created, warnings });
+        return true;
+      }
+    }
+
+    throw new HttpError(404, 'Order route not found');
+  }
+
+  throw new HttpError(404, 'API route not found');
+};
+
+

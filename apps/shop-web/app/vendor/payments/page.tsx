@@ -1,0 +1,10 @@
+"use client"
+
+import { useEffect, useState } from "react"
+import { PortalShell, StateMessage } from "../../components/PortalShell"
+import { api } from "../../lib/api"
+
+type Payment = { id: string; amount: string | number; method: string; status: string; receivedAt?: string | null; order?: { orderNumber: string; customerId?: string | null }; receivedBy?: { name: string } | null; deliveryPartner?: { name: string } | null }
+type Identity = { vendor: { id: string } | null }
+
+export default function VendorPayments() { const [payments, setPayments] = useState<Payment[]>([]); const [error, setError] = useState(""); useEffect(() => { (async () => { try { const identity = await api<Identity>("/api/v1/marketplace/me"); if (!identity.vendor) throw new Error("Vendor access is not configured"); setPayments(await api<Payment[]>(`/api/v1/marketplace/vendors/${identity.vendor.id}/payments`)) } catch (e) { setError(e instanceof Error ? e.message : "Unable to load payments") } })() }, []); return <PortalShell title="Vendor payments" subtitle="Collections recorded for your orders." links={[{ label: "Dashboard", href: "/vendor/dashboard" }, { label: "Products", href: "/vendor/products" }, { label: "Orders", href: "/vendor/orders" }, { label: "Delivery partners", href: "/vendor/delivery-partners" }, { label: "Payments", href: "/vendor/payments" }]}>{error && <StateMessage error>{error}</StateMessage>}<section className="portal-panel">{payments.length === 0 ? <div className="portal-empty">No payments recorded.</div> : <table className="portal-table"><thead><tr><th>Order</th><th>Amount</th><th>Method</th><th>Status</th><th>Collected by</th><th>Date</th></tr></thead><tbody>{payments.map((payment) => <tr key={payment.id}><td>{payment.order?.orderNumber || "Order"}</td><td>₹{Number(payment.amount).toLocaleString("en-IN")}</td><td>{payment.method}</td><td><span className="status-badge">{payment.status}</span></td><td>{payment.deliveryPartner?.name || payment.receivedBy?.name || "Online"}</td><td>{payment.receivedAt ? new Date(payment.receivedAt).toLocaleString("en-IN") : "-"}</td></tr>)}</tbody></table>}</section></PortalShell> }

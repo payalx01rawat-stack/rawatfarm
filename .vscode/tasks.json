@@ -1,0 +1,95 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "FarmMitra API tests",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["test", "--workspace", "@farmmitra/api"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra workspace build",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "build", "--workspaces", "--if-present"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra Prisma validate",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "db:validate"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra Prisma generate",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "db:generate"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra seed local development data",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "db:seed"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra API dev server",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "dev", "--workspace", "@farmmitra/api"],
+      "isBackground": true,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra shop dev server",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "dev", "--workspace", "@farmmitra/shop-web"],
+      "isBackground": true,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra admin dev server",
+      "type": "shell",
+      "command": "npm.cmd",
+      "args": ["run", "dev", "--workspace", "@farmmitra/admin-web"],
+      "isBackground": true,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra Git status",
+      "type": "shell",
+      "command": "git.exe",
+      "args": ["status", "--short"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "FarmMitra Git log",
+      "type": "shell",
+      "command": "git.exe",
+      "args": ["log", "-1", "--oneline"],
+      "isBackground": false,
+      "problemMatcher": [],
+      "group": "build"
+    }
+  ]
+}

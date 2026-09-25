@@ -1,0 +1,9 @@
+"use client"
+
+import { useEffect, useState } from "react"
+import { useRouter } from "next/navigation"
+import { PortalShell, StateMessage } from "../../components/PortalShell"
+import { api } from "../../lib/api"
+
+type Delivery = { id: string; status: string; deliveryAddress: string; order: { id: string; orderNumber: string; status: string; totalAmount: string | number; items: { productNameSnapshot: string | null; orderedQuantity: string | number }[] } }
+export default function DeliveryOrders() { const [deliveries, setDeliveries] = useState<Delivery[]>([]); const [error, setError] = useState(""); const router = useRouter(); useEffect(() => { api<Delivery[]>("/api/v1/marketplace/delivery/orders").then(setDeliveries).catch((e) => setError(e instanceof Error ? e.message : "Unable to load deliveries")) }, []); return <PortalShell title="My deliveries" subtitle="Only orders assigned to your account appear here." links={[{ label: "Dashboard", href: "/delivery/dashboard" }, { label: "Deliveries", href: "/delivery/orders" }]}>{error && <StateMessage error>{error}</StateMessage>}<section className="portal-panel">{deliveries.length === 0 ? <div className="portal-empty">No deliveries assigned.</div> : <table className="portal-table"><thead><tr><th>Order</th><th>Products</th><th>Address</th><th>Amount</th><th>Status</th></tr></thead><tbody>{deliveries.map((item) => <tr key={item.id} onClick={() => router.push(`/delivery/orders/${item.order.id}`)} style={{ cursor: "pointer" }}><td><strong>{item.order.orderNumber}</strong></td><td>{item.order.items.map((product) => `${product.productNameSnapshot || "Product"} × ${product.orderedQuantity}`).join(", ")}</td><td>{item.deliveryAddress}</td><td>₹{Number(item.order.totalAmount).toLocaleString("en-IN")}</td><td><span className="status-badge">{item.order.status.replaceAll("_", " ")}</span></td></tr>)}</tbody></table>}</section></PortalShell> }

@@ -1,0 +1,20 @@
+{
+    "name":  "@farmmitra/api",
+    "version":  "0.1.0",
+    "private":  true,
+    "main":  "src/server.ts",
+    "scripts":  {
+                    "dev":  "tsx watch src/server.ts",
+                    "build":  "tsc --outDir dist --noEmit false",
+                    "test":  "tsx --test src/*.test.ts",
+                    "start":  "tsx src/server.ts"
+                },
+    "dependencies":  {
+                         "@farmmitra/config":  "0.1.0",
+                         "@farmmitra/database":  "0.1.0",
+                         "@farmmitra/shared-types":  "0.1.0",
+                         "bcryptjs":  "^3.0.2",
+                         "jsonwebtoken":  "^9.0.2",
+                         "zod":  "^3.24.1"
+                     }
+}

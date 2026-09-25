@@ -1,0 +1,16 @@
+"use client"
+
+import { useEffect, useState } from "react"
+import { PortalShell, StateMessage } from "../../components/PortalShell"
+import { api } from "../../lib/api"
+
+type Partner = { userId: string; capabilities?: string[]; user: { name: string; mobile?: string | null; status: string } }
+type Identity = { vendor: { id: string } | null }
+
+export default function VendorPartners() {
+  const [vendorId, setVendorId] = useState(""); const [partners, setPartners] = useState<Partner[]>([]); const [userId, setUserId] = useState(""); const [message, setMessage] = useState(""); const [error, setError] = useState("")
+  async function load() { try { const identity = await api<Identity>("/api/v1/marketplace/me"); if (!identity.vendor) throw new Error("Vendor access is not configured"); setVendorId(identity.vendor.id); setPartners(await api<Partner[]>(`/api/v1/marketplace/vendors/${identity.vendor.id}/delivery-partners`)) } catch (e) { setError(e instanceof Error ? e.message : "Unable to load partners") } }
+  useEffect(() => { load() }, [])
+  async function add() { try { await api(`/api/v1/marketplace/vendors/${vendorId}/delivery-partners`, { method: "POST", body: JSON.stringify({ userId, capabilities: ["DELIVERY", "PAYMENT_COLLECTION"] }) }); setUserId(""); setMessage("Delivery partner added"); load() } catch (e) { setError(e instanceof Error ? e.message : "Unable to add partner") } }
+  return <PortalShell title="Delivery partners" subtitle="Partners assigned to this vendor only." links={[{ label: "Dashboard", href: "/vendor/dashboard" }, { label: "Products", href: "/vendor/products" }, { label: "Orders", href: "/vendor/orders" }, { label: "Delivery partners", href: "/vendor/delivery-partners" }, { label: "Payments", href: "/vendor/payments" }]}>{message && <StateMessage>{message}</StateMessage>}{error && <StateMessage error>{error}</StateMessage>}<section className="portal-panel"><h2>Add existing user</h2><div className="portal-actions"><input value={userId} onChange={(event) => setUserId(event.target.value)} placeholder="Delivery partner user ID" /><button className="primary" disabled={!userId} onClick={add}>Add partner</button></div></section><section className="portal-panel">{partners.length === 0 ? <div className="portal-empty">No delivery partners assigned.</div> : <table className="portal-table"><thead><tr><th>Name</th><th>Phone</th><th>Capabilities</th><th>Status</th></tr></thead><tbody>{partners.map((partner) => <tr key={partner.userId}><td><strong>{partner.user.name}</strong></td><td>{partner.user.mobile || "Not provided"}</td><td>{(partner.capabilities || []).join(", ") || "DELIVERY"}</td><td><span className="status-badge">{partner.user.status}</span></td></tr>)}</tbody></table>}</section></PortalShell>
+}

@@ -1,0 +1,33 @@
+{
+  "name": "farmmitra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "B2B meat, poultry, fish and egg distribution management platform",
+  "packageManager": "npm@10.9.2",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "workers/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev": "npm run dev --workspace @farmmitra/api",
+    "db:generate": "npm run db:generate --workspace @farmmitra/database",
+    "db:validate": "npm run db:validate --workspace @farmmitra/database",
+    "db:migrate": "npm run db:migrate --workspace @farmmitra/database",
+    "db:seed": "npm run db:seed --workspace @farmmitra/database",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.10.2",
+    "cross-env": "^10.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "jsonwebtoken": "^9.0.3"
+  }
+}
