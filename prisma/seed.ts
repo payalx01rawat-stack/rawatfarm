@@ -356,8 +356,8 @@ async function main(): Promise<void> {
   await prisma.warehouse.upsert({ where: { code: 'MAIN-WH' }, update: { branchId: branch.id, isActive: true }, create: { branchId: branch.id, name: 'Main Warehouse', code: 'MAIN-WH' } });
   const category = await prisma.category.upsert({ where: { name: 'Fresh Foods' }, update: {}, create: { name: 'Fresh Foods' } });
   const kg = await prisma.unit.findUniqueOrThrow({ where: { code: 'KG' } });
-  for (const [vendor, name, sku, price] of [[vendors[0], 'Fresh Chicken', 'LOCAL-CHICKEN-A', 280], [vendors[1], 'Fresh Mutton', 'LOCAL-MUTTON-B', 720]] as const) {
-    const product = await prisma.product.upsert({ where: { sku }, update: { vendorId: vendor.id, status: 'ACTIVE', name }, create: { categoryId: category.id, unitId: kg.id, vendorId: vendor.id, name, sku, description: `Seed product from ${vendor.name}` } });
+  for (const [vendor, name, sku, price, stockQuantity] of [[vendors[0], 'Fresh Chicken', 'LOCAL-CHICKEN-A', 280, 25], [vendors[1], 'Fresh Mutton', 'LOCAL-MUTTON-B', 720, 3], [vendors[0], 'Fresh Eggs', 'LOCAL-EGGS-A', 120, 0]] as const) {
+    const product = await prisma.product.upsert({ where: { sku }, update: { vendorId: vendor.id, status: 'ACTIVE', name, stockQuantity }, create: { categoryId: category.id, unitId: kg.id, vendorId: vendor.id, name, sku, stockQuantity, description: `Seed product from ${vendor.name}` } });
     const existingPrice = await prisma.productPrice.findFirst({ where: { productId: product.id, shopId: null } });
     if (existingPrice) await prisma.productPrice.update({ where: { id: existingPrice.id }, data: { price, validFrom: new Date() } });
     else await prisma.productPrice.create({ data: { productId: product.id, price, validFrom: new Date() } });

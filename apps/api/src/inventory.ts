@@ -30,3 +30,9 @@ export const isReservationActionAllowed = (status: string, action: ReservationAc
   if (action === 'consume') return status === 'ACTIVE';
   return false;
 };
+
+export const stockStatus = (quantity: Prisma.Decimal | string | number, threshold: Prisma.Decimal | string | number, trackInventory = true): 'IN_STOCK' | 'LOW_STOCK' | 'OUT_OF_STOCK' | 'NOT_TRACKED' => {
+  if (!trackInventory) return 'NOT_TRACKED';
+  const stock = new Prisma.Decimal(quantity);
+  return stock.lte(0) ? 'OUT_OF_STOCK' : stock.lte(new Prisma.Decimal(threshold)) ? 'LOW_STOCK' : 'IN_STOCK';
+};

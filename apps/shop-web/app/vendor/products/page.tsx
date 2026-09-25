@@ -7,7 +7,7 @@ import { api } from "../../lib/api"
 
 type Product = { id: string; name: string; sku: string; status: string; imageUrl?: string | null; category: { name: string }; unit: { code: string }; prices?: { price: string | number }[] }
 type Identity = { vendor: { id: string } | null }
-const links = [{ label: "Dashboard", href: "/vendor/dashboard" }, { label: "Products", href: "/vendor/products" }, { label: "Orders", href: "/vendor/orders" }]
+const links = [{ label: "Dashboard", href: "/vendor/dashboard" }, { label: "Products", href: "/vendor/products" }, { label: "Inventory", href: "/vendor/inventory" }, { label: "Orders", href: "/vendor/orders" }]
 
 export default function VendorProducts() {
   const [vendorId, setVendorId] = useState("")

@@ -7,7 +7,7 @@ export function PortalShell({ title, subtitle, children, links = [] }: { title: 
   const router = useRouter()
   const pathname = usePathname()
   const isVendor = pathname.startsWith("/vendor")
-  const navigation = isVendor ? [{ label: "Dashboard", href: "/vendor/dashboard" }, { label: "Products", href: "/vendor/products" }, { label: "Orders", href: "/vendor/orders" }, { label: "Delivery", href: "/vendor/delivery-dashboard" }, { label: "Collections", href: "/vendor/collections" }, { label: "Outstanding", href: "/vendor/outstanding" }, { label: "Settings", href: "/vendor/settings" }] : links
+  const navigation = isVendor ? [{ label: "Dashboard", href: "/vendor/dashboard" }, { label: "Products", href: "/vendor/products" }, { label: "Inventory", href: "/vendor/inventory" }, { label: "Orders", href: "/vendor/orders" }, { label: "Delivery", href: "/vendor/delivery-dashboard" }, { label: "Collections", href: "/vendor/collections" }, { label: "Outstanding", href: "/vendor/outstanding" }, { label: "Settings", href: "/vendor/settings" }] : links
   function logout() {
     localStorage.removeItem("farmmitra_shop_token")
     localStorage.removeItem("farmmitra_shop_user")

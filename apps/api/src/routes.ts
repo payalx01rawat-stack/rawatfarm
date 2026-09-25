@@ -1,11 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@farmmitra/database';
 import { authenticate, hashPassword, HttpError, isDeliveryRole, isVendorRole, requirePermission, signAccessToken, verifyPassword } from './auth.js';
 import { audit } from './audit.js';
 import { pathParts, readJson, sendJson } from './http.js';
-import { addressSchema, adminVendorCreateSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, vendorStatusSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema } from './schemas.js';
+import { addressSchema, adminVendorCreateSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, vendorStatusSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema, stockAdjustmentSchema } from './schemas.js';
 import { DEFAULT_ORDER_CUTOFF, DEFAULT_ORDER_TIMEZONE, ORDER_STATUSES, calculateDeliveryDate, deriveDeliveryStatus, hashRequestPayload, isValidStatusTransition, orderSchema, parseRequestedDeliveryDate, quantityValidationError, type QuantityChange } from './orders.js';
-import { calculateAvailableQuantity, isReservationActionAllowed, parseDecimalQuantity } from './inventory.js';
+import { calculateAvailableQuantity, isReservationActionAllowed, parseDecimalQuantity, stockStatus } from './inventory.js';
 import { buildPaymentSummary } from './payment-summary.js';
 
 const body = async <T>(request: IncomingMessage, schema: { parse(value: unknown): T }): Promise<T> => {
@@ -95,6 +96,40 @@ const assertInventoryIdempotency = async (database: PrismaClient, request: Incom
     throw new HttpError(409, 'Idempotency key was already used with a different request');
   }
   return { idempotent: true };
+};
+
+const stockDetails = (item: { stockQuantity: Prisma.Decimal; lowStockThreshold: Prisma.Decimal; trackInventory: boolean }) => ({
+  stockStatus: stockStatus(item.stockQuantity, item.lowStockThreshold, item.trackInventory),
+  ...(item.trackInventory ? { stockQuantity: item.stockQuantity } : {}),
+  lowStockThreshold: item.lowStockThreshold,
+  trackInventory: item.trackInventory,
+});
+
+const deductStock = async (tx: Prisma.TransactionClient, item: { productId: string; variantId: string | null; quantity: Prisma.Decimal; orderItemId: string; vendorId: string; orderId: string; userId: string }) => {
+  const target = item.variantId ? await tx.productVariant.findUnique({ where: { id: item.variantId }, select: { id: true, productId: true, stockQuantity: true, trackInventory: true } }) : await tx.product.findUnique({ where: { id: item.productId }, select: { id: true, stockQuantity: true, trackInventory: true } });
+  if (!target || (item.variantId && (!('productId' in target) || target.productId !== item.productId))) throw new HttpError(400, 'Variant is unavailable');
+  if (!target.trackInventory) return;
+  let updated;
+  try {
+    updated = item.variantId ? await tx.productVariant.updateMany({ where: { id: item.variantId, trackInventory: true, stockQuantity: { gte: item.quantity } }, data: { stockQuantity: { decrement: item.quantity } } }) : await tx.product.updateMany({ where: { id: item.productId, trackInventory: true, stockQuantity: { gte: item.quantity } }, data: { stockQuantity: { decrement: item.quantity } } });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034') throw new HttpError(409, 'Stock is being updated; retry checkout');
+    throw error;
+  }
+  if (updated.count !== 1) throw new HttpError(409, 'Insufficient stock');
+  await tx.stockMovement.create({ data: { vendorId: item.vendorId, productId: item.productId, variantId: item.variantId, orderItemId: item.orderItemId, quantityDelta: item.quantity.neg(), movementType: 'ORDER_DEDUCTION', reason: 'Marketplace checkout', referenceType: 'ORDER', referenceId: item.orderId, stockBefore: target.stockQuantity, stockAfter: target.stockQuantity.minus(item.quantity), createdByUserId: item.userId } });
+};
+
+const restoreStock = async (tx: Prisma.TransactionClient, item: { productId: string; variantId: string | null; quantity: Prisma.Decimal; orderItemId: string; vendorId: string; orderId: string; userId: string }) => {
+  const previous = await tx.stockMovement.findFirst({ where: { orderItemId: item.orderItemId, movementType: 'ORDER_DEDUCTION' }, orderBy: { createdAt: 'asc' } });
+  if (!previous) return;
+  const alreadyRestored = await tx.stockMovement.findFirst({ where: { orderItemId: item.orderItemId, movementType: { in: ['ORDER_RESTORE', 'ORDER_CANCELLATION'] } } });
+  if (alreadyRestored) return;
+  const target = item.variantId ? await tx.productVariant.findUnique({ where: { id: item.variantId }, select: { stockQuantity: true } }) : await tx.product.findUnique({ where: { id: item.productId }, select: { stockQuantity: true } });
+  if (!target) throw new HttpError(409, 'Product inventory no longer exists');
+  if (item.variantId) await tx.productVariant.update({ where: { id: item.variantId }, data: { stockQuantity: { increment: item.quantity } } });
+  else await tx.product.update({ where: { id: item.productId }, data: { stockQuantity: { increment: item.quantity } } });
+  await tx.stockMovement.create({ data: { vendorId: item.vendorId, productId: item.productId, variantId: item.variantId, orderItemId: item.orderItemId, quantityDelta: item.quantity, movementType: 'ORDER_CANCELLATION', reason: 'Order cancelled', referenceType: 'ORDER', referenceId: item.orderId, stockBefore: target.stockQuantity, stockAfter: target.stockQuantity.plus(item.quantity), createdByUserId: item.userId } });
 };
 
 export const handleApi = async (request: IncomingMessage, response: ServerResponse, database: PrismaClient): Promise<boolean> => {
@@ -498,6 +533,15 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         sendJson(response, 200, await database.masterOrder.findMany({ include: { customer: true, subOrders: { include: { vendor: true, payments: true, deliveries: true } } }, orderBy: { createdAt: 'desc' } }));
         return true;
       }
+      if (method === 'GET' && parts[4] === 'inventory' && parts.length === 5) {
+        const query = new URL(request.url ?? '/', 'http://localhost');
+        const status = query.searchParams.get('status');
+        const search = query.searchParams.get('search')?.trim();
+        const products = await database.product.findMany({ where: { vendorId: query.searchParams.get('vendorId') || undefined, ...(search ? { OR: [{ name: { contains: search } }, { sku: { contains: search } }] } : {}) }, include: { vendor: true, variants: true }, orderBy: { name: 'asc' } });
+        const visible = products.map((product) => ({ ...product, ...stockDetails(product), variants: product.variants.map((variant) => ({ ...variant, ...stockDetails(variant) })) })).filter((product) => !status || product.stockStatus === status || product.variants.some((variant) => variant.stockStatus === status));
+        sendJson(response, 200, visible);
+        return true;
+      }
       if (method === 'GET' && parts[4] === 'delivery-partners' && parts.length === 5) {
         sendJson(response, 200, await database.vendorUser.findMany({ include: { vendor: true, user: true }, orderBy: { assignedAt: 'desc' } }));
         return true;
@@ -646,10 +690,10 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       const search = query.searchParams.get('search')?.trim();
       const products = await database.product.findMany({
         where: { status: 'ACTIVE', vendor: { is: { isActive: true, status: 'APPROVED' } }, ...(search ? { OR: [{ name: { contains: search } }, { description: { contains: search } }] } : {}) },
-        include: { vendor: true, category: true, unit: true, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
+        include: { vendor: true, category: true, unit: true, variants: { where: { status: 'ACTIVE' }, include: { unit: true } }, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
         orderBy: { name: 'asc' },
       });
-      const productsWithPrices = await Promise.all(products.map(async (product) => ({ ...product, price: (await database.productPrice.findFirst({ where: { productId: product.id, shopId: null }, orderBy: { validFrom: 'desc' } }))?.price ?? null })));
+      const productsWithPrices = await Promise.all(products.map(async (product) => ({ id: product.id, name: product.name, description: product.description, imageUrl: product.imageUrl, sku: product.sku, vendor: product.vendor, category: product.category, unit: product.unit, price: (await database.productPrice.findFirst({ where: { productId: product.id, shopId: null }, orderBy: { validFrom: 'desc' } }))?.price ?? null, stockStatus: stockStatus(product.stockQuantity, product.lowStockThreshold, product.trackInventory), variants: product.variants?.map((variant) => ({ id: variant.id, name: variant.name, sku: variant.sku, unit: variant.unit, stockStatus: stockStatus(variant.stockQuantity, variant.lowStockThreshold, variant.trackInventory) })) ?? [] })));
       sendJson(response, 200, productsWithPrices);
       return true;
     }
@@ -671,9 +715,35 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       const vendorId = idFrom(parts, 4);
       const context = await authenticate(request, database);
       const scopedVendorId = await vendorIdForContext(context, database);
+      if (!isAdminLike(context.roles) && !isVendorRole(context.roles)) throw new HttpError(403, 'Vendor access is required');
       if (scopedVendorId && scopedVendorId !== vendorId) throw new HttpError(403, 'Vendor is outside your scope');
       if (method === 'GET' && parts[5] === 'products' && parts.length === 6) {
-        sendJson(response, 200, await database.product.findMany({ where: { vendorId }, include: { category: true, unit: true, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } }, orderBy: { name: 'asc' } }));
+        const products = await database.product.findMany({ where: { vendorId }, include: { category: true, unit: true, variants: true, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } }, orderBy: { name: 'asc' } });
+        sendJson(response, 200, products.map((product) => ({ ...product, ...stockDetails(product), variants: product.variants.map((variant) => ({ ...variant, ...stockDetails(variant) })) })));
+        return true;
+      }
+      if (method === 'GET' && parts[5] === 'products' && parts.length === 8 && parts[7] === 'inventory') {
+        const productId = idFrom(parts, 6);
+        const product = await database.product.findFirst({ where: { id: productId, vendorId }, include: { variants: true } });
+        if (!product) throw new HttpError(404, 'Product not found');
+        const movements = await database.stockMovement.findMany({ where: { vendorId, productId }, orderBy: { createdAt: 'desc' }, take: 200 });
+        sendJson(response, 200, { product: { ...product, ...stockDetails(product), variants: product.variants.map((variant) => ({ ...variant, ...stockDetails(variant) })) }, movements });
+        return true;
+      }
+      if (method === 'PATCH' && parts[5] === 'products' && parts.length === 8 && parts[7] === 'inventory') {
+        const productId = idFrom(parts, 6);
+        const input = await body(request, stockAdjustmentSchema);
+        const result = await database.$transaction(async (tx) => {
+          const current = await tx.product.findFirst({ where: { id: productId, vendorId } });
+          if (!current) throw new HttpError(404, 'Product not found');
+          const quantity = new Prisma.Decimal(input.quantity);
+          const next = input.direction === 'INCREASE' ? current.stockQuantity.plus(quantity) : current.stockQuantity.minus(quantity);
+          if (next.isNegative()) throw new HttpError(400, 'Stock cannot become negative');
+          const updated = await tx.product.update({ where: { id: productId }, data: { stockQuantity: next, ...(input.lowStockThreshold === undefined ? {} : { lowStockThreshold: input.lowStockThreshold }), ...(input.trackInventory === undefined ? {} : { trackInventory: input.trackInventory }) } });
+          await tx.stockMovement.create({ data: { vendorId, productId, quantityDelta: input.direction === 'INCREASE' ? quantity : quantity.neg(), movementType: 'MANUAL_ADJUSTMENT', reason: input.reason, stockBefore: current.stockQuantity, stockAfter: next, createdByUserId: context.userId } });
+          return { ...updated, ...stockDetails(updated) };
+        });
+        sendJson(response, 200, result);
         return true;
       }
       if (method === 'PATCH' && parts[5] === 'products' && parts.length === 7) {
@@ -797,25 +867,27 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       if (input.addressId && !selectedAddress) throw new HttpError(404, 'Delivery address not found');
       if (!selectedAddress) throw new HttpError(400, 'A delivery address is required');
       const addressSnapshot = [selectedAddress.line1, selectedAddress.line2, selectedAddress.city, selectedAddress.state, selectedAddress.postalCode].filter(Boolean).join(', ');
-      const grouped = new Map<string, Array<{ input: (typeof input.items)[number]; product: { id: string; unitId: string; name: string; sku: string; unit: { code: string } }; price: number }>>();
+      const grouped = new Map<string, Array<{ input: (typeof input.items)[number]; product: { id: string; unitId: string; name: string; sku: string; unit: { code: string } }; variant: { id: string; unitId: string; name: string; sku: string; unit: { code: string } } | null; price: number }>>();
       for (const item of input.items) {
         const product = await database.product.findUnique({ where: { id: item.productId }, include: { unit: true, vendor: true } });
-        if (!product || product.status !== 'ACTIVE' || !product.vendorId || !product.vendor?.isActive) throw new HttpError(400, `Product is unavailable: ${item.productId}`);
+        if (!product || product.status !== 'ACTIVE' || !product.vendorId || !product.vendor?.isActive || product.vendor.status !== 'APPROVED') throw new HttpError(400, `Product is unavailable: ${item.productId}`);
+        const variant = item.variantId ? await database.productVariant.findUnique({ where: { id: item.variantId }, include: { unit: true } }) : null;
+        if (item.variantId && (!variant || variant.productId !== product.id || variant.status !== 'ACTIVE')) throw new HttpError(400, 'Variant is unavailable');
         const availableProduct = product;
-        const price = await database.productPrice.findFirst({ where: { productId: item.productId, shopId: null }, orderBy: { validFrom: 'desc' } });
+        const price = await database.productPrice.findFirst({ where: item.variantId ? { variantId: item.variantId, shopId: null } : { productId: item.productId, shopId: null }, orderBy: { validFrom: 'desc' } });
         if (!price) throw new HttpError(400, `Pricing is unavailable for ${product.name}`);
         const items = grouped.get(product.vendorId) ?? [];
-        items.push({ input: item, product: availableProduct, price: Number(price.price) });
+        items.push({ input: item, product: availableProduct, variant, price: Number(price.price) });
         grouped.set(product.vendorId, items);
       }
       const totalAmount = Array.from(grouped.values()).flat().reduce((sum, item) => sum + item.price * item.input.quantity, 0);
       const master = await database.$transaction(async (tx) => {
-        const createdMaster = await tx.masterOrder.create({ data: { orderNumber: `FM-M-${Date.now()}`, customerId: context.userId, totalAmount, deliveryAddress: selectedAddress } });
+        const createdMaster = await tx.masterOrder.create({ data: { orderNumber: `FM-M-${randomUUID()}`, customerId: context.userId, totalAmount, deliveryAddress: selectedAddress } });
         for (const [vendorId, items] of grouped) {
           const subtotal = items.reduce((sum, item) => sum + item.price * item.input.quantity, 0);
-          await tx.order.create({
+          const createdOrder = await tx.order.create({
             data: {
-              orderNumber: `FM-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+              orderNumber: `FM-${randomUUID()}`,
               shopId: fallbackShop.id,
               branchId: branch.branchId,
               vendorId,
@@ -827,10 +899,16 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
               totalAmount: subtotal,
               orderDate: new Date(),
               placedAt: new Date(),
-              items: { create: items.map(({ input: item, product, price }) => ({ productId: product.id, unitId: item.unitId ?? product.unitId, productNameSnapshot: product.name, variantNameSnapshot: product.name, skuSnapshot: product.sku, unitSnapshot: product.unit.code, orderedQuantity: item.quantity, unitPrice: price, lineTotal: price * item.quantity, notes: item.notes })) },
+              items: { create: items.map(({ input: item, product, variant, price }) => ({ productId: product.id, variantId: variant?.id, unitId: item.unitId ?? variant?.unitId ?? product.unitId, productNameSnapshot: product.name, variantNameSnapshot: variant?.name ?? product.name, skuSnapshot: variant?.sku ?? product.sku, unitSnapshot: variant?.unit.code ?? product.unit.code, orderedQuantity: item.quantity, unitPrice: price, lineTotal: price * item.quantity, notes: item.notes })) },
               statusHistory: { create: [{ newStatus: 'PLACED', changedBy: context.userId, reason: 'MARKETPLACE_CHECKOUT' }] },
             },
+            include: { items: true },
           });
+          for (const createdItem of createdOrder.items) {
+            const source = items.find(({ input }) => input.productId === createdItem.productId && (input.variantId ?? null) === (createdItem.variantId ?? null));
+            if (!source) throw new HttpError(500, 'Order item could not be matched to inventory');
+            await deductStock(tx, { productId: createdItem.productId, variantId: createdItem.variantId, quantity: createdItem.orderedQuantity, orderItemId: createdItem.id, vendorId, orderId: createdOrder.id, userId: context.userId });
+          }
         }
         return tx.masterOrder.findUnique({ where: { id: createdMaster.id }, include: { subOrders: { include: { vendor: true, items: true } } } });
       });
@@ -904,15 +982,21 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     if (method === 'GET' && parts.length === 4) {
       await authAndPermission(request, database, `${permissionResource}.read`);
       if (resourceName === 'products') {
+        const query = new URL(request.url ?? '/', 'http://localhost');
+        const status = query.searchParams.get('status');
+        const search = query.searchParams.get('search')?.trim();
+        const vendorId = query.searchParams.get('vendorId');
         const products = await database.product.findMany({
-          where: { status: 'ACTIVE' },
-          include: { vendor: true, category: true, unit: true, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
+          where: { ...(status ? { status: status as never } : {}), ...(vendorId ? { vendorId } : {}), ...(search ? { OR: [{ name: { contains: search } }, { sku: { contains: search } }] } : {}) },
+          include: { vendor: true, category: true, unit: true, variants: { include: { unit: true } }, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
           orderBy: { name: 'asc' },
         });
         const productsWithVendor = products.map((product) => ({
           ...product,
           price: product.prices[0]?.price ?? null,
           vendorName: product.vendor?.name ?? null,
+          stockStatus: stockStatus(product.stockQuantity, product.lowStockThreshold, product.trackInventory),
+          variants: product.variants.map((variant) => ({ ...variant, stockStatus: stockStatus(variant.stockQuantity, variant.lowStockThreshold, variant.trackInventory) })),
         }));
         sendJson(response, 200, productsWithVendor);
         return true;
@@ -2064,15 +2148,22 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
       if (method === 'POST' && parts[4] === 'cancel') {
         requirePermission(context, 'orders.cancel');
-        if (order.status === 'CANCELLED') throw new HttpError(400, 'Order already cancelled');
+        if (order.status === 'CANCELLED') {
+          sendJson(response, 200, order);
+          return true;
+        }
         const newStatus = 'CANCELLED';
         if (!isValidStatusTransition(order.status, newStatus)) {
           throw new HttpError(400, 'Order cannot be cancelled in its current status');
         }
-        const updated = await database.order.update({
-          where: { id: orderId },
-          data: { status: newStatus, cancelledAt: new Date(), cancellationReason: 'Cancelled by request', statusHistory: { create: [{ previousStatus: order.status, newStatus, changedBy: context.userId, reason: 'CANCEL_ORDER', notes: 'Order cancelled' }] } },
-          include: { items: true, statusHistory: true },
+        const updated = await database.$transaction(async (tx) => {
+          const current = await tx.order.findUnique({ where: { id: orderId }, include: { items: true } });
+          if (!current) throw new HttpError(404, 'Order not found');
+          if (current.status === 'CANCELLED') return current;
+          if (!isValidStatusTransition(current.status, newStatus)) throw new HttpError(400, 'Order cannot be cancelled in its current status');
+          const cancelled = await tx.order.update({ where: { id: orderId }, data: { status: newStatus, cancelledAt: new Date(), cancellationReason: 'Cancelled by request', statusHistory: { create: [{ previousStatus: current.status, newStatus, changedBy: context.userId, reason: 'CANCEL_ORDER', notes: 'Order cancelled' }] } }, include: { items: true, statusHistory: true } });
+          if (current.vendorId) for (const item of current.items) await restoreStock(tx, { productId: item.productId, variantId: item.variantId, quantity: item.orderedQuantity, orderItemId: item.id, vendorId: current.vendorId, orderId: current.id, userId: context.userId });
+          return cancelled;
         });
         await audit(database, context.userId, 'UPDATE', 'Order', orderId, { status: newStatus });
         sendJson(response, 200, updated);

@@ -30,6 +30,16 @@ enum ProductStatus {
   INACTIVE
 }
 
+enum StockMovementType {
+  INITIAL_STOCK
+  MANUAL_ADJUSTMENT
+  ORDER_DEDUCTION
+  ORDER_RESTORE
+  ORDER_CANCELLATION
+  RETURN_RESTORE
+  CORRECTION
+}
+
 enum InventoryTransactionType {
   PURCHASE
   SALE
@@ -137,6 +147,7 @@ model User {
   vendorAccess VendorUser[]
   marketplaceOrders MasterOrder[] @relation("MarketplaceOrderCustomer")
   customerAddresses CustomerAddress[]
+  stockMovements StockMovement[]
 }
 
 model Role {
@@ -217,6 +228,7 @@ model Vendor {
   orders       Order[]
   deliveries   Delivery[]
   payments     Payment[]
+  stockMovements StockMovement[]
 
   @@index([isActive, createdAt])
 }
@@ -387,6 +399,10 @@ model Product {
   vendorId         String?
   vendor           Vendor?         @relation(fields: [vendorId], references: [id], onDelete: SetNull)
   imageUrl         String?
+  stockQuantity    Decimal          @default(0) @db.Decimal(14, 3)
+  lowStockThreshold Decimal         @default(5) @db.Decimal(14, 3)
+  trackInventory   Boolean          @default(true)
+  stockMovements   StockMovement[]
 
   @@index([vendorId, status])
 }
@@ -406,6 +422,10 @@ model ProductVariant {
   reservations  StockReservation[]
   purchaseItems PurchaseItem[]
   returnItems   ReturnItem[]
+  stockQuantity Decimal          @default(0) @db.Decimal(14, 3)
+  lowStockThreshold Decimal      @default(5) @db.Decimal(14, 3)
+  trackInventory Boolean         @default(true)
+  stockMovements StockMovement[]
 
   @@index([productId, status])
 }
@@ -555,11 +575,37 @@ model OrderItem {
   unit               Unit            @relation(fields: [unitId], references: [id])
   pickListItems      PickListItem[]
   deliveryItems      DeliveryItem[]
-
+  stockMovements     StockMovement[]
   @@index([orderId])
   @@index([productId])
   @@index([variantId])
   @@index([productId, variantId, orderId])
+}
+
+model StockMovement {
+  id              String            @id @default(cuid())
+  vendorId        String
+  productId       String
+  variantId       String?
+  orderItemId     String?
+  quantityDelta   Decimal           @db.Decimal(14, 3)
+  movementType    StockMovementType
+  reason          String
+  referenceType   String?
+  referenceId     String?
+  stockBefore     Decimal           @db.Decimal(14, 3)
+  stockAfter      Decimal           @db.Decimal(14, 3)
+  createdByUserId String?
+  createdAt       DateTime          @default(now())
+  vendor          Vendor            @relation(fields: [vendorId], references: [id])
+  product         Product           @relation(fields: [productId], references: [id])
+  variant         ProductVariant?   @relation(fields: [variantId], references: [id])
+  orderItem       OrderItem?        @relation(fields: [orderItemId], references: [id], onDelete: SetNull)
+  createdBy       User?             @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([vendorId, createdAt])
+  @@index([productId, variantId, createdAt])
+  @@index([referenceId])
 }
 
 model OrderStatusHistory {
