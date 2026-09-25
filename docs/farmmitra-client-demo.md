@@ -233,8 +233,7 @@ If port `3000` is occupied, stop only the stale frontend Node process before res
 
 ## Known Limitations
 
-- Browser automation is not currently available in this environment.
-- Mobile interactive verification remains pending.
+- Browser and mobile interactive verification was completed for the current release checkpoint.
 - Two legacy catalog records lack current vendor/price linkage but are not exposed through the customer marketplace.
 - Product images use URL-based storage rather than S3 or file uploads.
 - No payment gateway is integrated; the system records cash and UPI collection.
@@ -253,4 +252,4 @@ The current verified local baseline is:
 - Multi-vendor checkout: verified with Vendor A and Vendor B products
 - Vendor isolation: unauthorized cross-vendor access returns `403`
 - Admin product and delivery feeds: authorized live endpoints return data
-- Browser/mobile interactive verification: unavailable in the current environment
+- Browser/mobile interactive verification: completed for the current release checkpoint

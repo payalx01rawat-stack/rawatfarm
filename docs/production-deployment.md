@@ -102,6 +102,12 @@ npm.cmd run db:migrate --workspace @farmmitra/database
 
 The migration command uses the existing migration history and is non-destructive. Do not use `prisma migrate reset`, delete the RDS database, or remove migration directories. For a new empty development database, Prisma will apply the checked-in migrations. If Prisma reports drift or a migration failure, stop and investigate rather than resetting the database.
 
+### Backup and rollback readiness
+
+Before applying any migration to an environment containing data, take and verify a database backup or managed-database snapshot. Record the backup identifier with the deployment change. Application and database rollback are separate concerns: restore the previous approved application commit and rebuild first, but do not attempt an automatic down migration unless a reviewed reverse migration exists. If a schema change must be reversed, stop the application, restore the verified database backup or snapshot according to the database provider procedure, then restore the previous application version. Never use `prisma migrate reset` for rollback.
+
+The current MVP release checkpoint is `fa2ec46`; the previous verified baseline is `e13affc`. Keep both commit identifiers in the deployment record so the application can be restored without rewriting Git history.
+
 ## Redis
 
 Redis is currently an infrastructure/schema requirement, not an active API dependency. The architecture documentation reserves Redis and BullMQ for asynchronous workers, but this repository contains no Redis client import and the current API request path does not use Redis.

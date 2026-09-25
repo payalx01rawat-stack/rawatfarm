@@ -121,7 +121,7 @@ export default function LoginPage() {
 
         <div className="connection">
           <span className="dot" />
-          API: localhost:4000
+          API: {API_URL}
         </div>
       </div>
     </main>

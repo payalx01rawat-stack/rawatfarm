@@ -2,9 +2,9 @@
 
 FarmMitra is a B2B distribution management platform for meat, poultry, fish and egg businesses.
 
-## Phase 1 foundation
+## MVP release
 
-This repository contains the monorepo foundation, MySQL 8 + Prisma database architecture, REST API health endpoint, shared packages, and safe development seed structure. Business workflows and frontend applications are intentionally not implemented yet.
+This repository contains the FarmMitra MVP marketplace, vendor operations, delivery app, REST API, MySQL + Prisma database architecture, shared packages, and safe development seed structure. The current verified release checkpoint is `fa2ec46`.
 
 ## Setup
 
