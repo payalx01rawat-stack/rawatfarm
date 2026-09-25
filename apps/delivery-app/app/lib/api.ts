@@ -13,6 +13,11 @@ export async function api<T>(path: string, options: RequestInit = {}, accessToke
     },
   })
   const data = await response.json().catch(() => null)
+  if (response.status === 401 && typeof window !== "undefined") {
+    localStorage.removeItem(tokenKey)
+    localStorage.removeItem("farmmitra_delivery_user")
+    window.location.assign("/")
+  }
   if (!response.ok) throw new Error(data?.error || "Request failed")
   return data as T
 }

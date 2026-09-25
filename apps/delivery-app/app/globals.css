@@ -1,9 +1,10 @@
 * { box-sizing: border-box; }
 :root { color-scheme: light; --ink: #17231b; --muted: #718076; --paper: #f6f8f3; --card: #fff; --line: #dfe7dd; --green: #1f6b3a; --orange: #e7663c; --yellow: #fff0ce; }
-html, body { margin: 0; min-height: 100%; font-family: Georgia, "Times New Roman", serif; background: var(--paper); color: var(--ink); }
+html, body { margin: 0; min-height: 100%; overflow-x: hidden; font-family: Georgia, "Times New Roman", serif; background: var(--paper); color: var(--ink); }
 button, input, select { font: inherit; }
 button { border: 0; border-radius: 10px; padding: 13px 16px; background: var(--green); color: white; cursor: pointer; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; }
 button:disabled { opacity: .55; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(231,102,60,.32); outline-offset: 2px; }
 input, select { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 13px; background: white; color: var(--ink); }
 label { display: grid; gap: 7px; color: var(--muted); font: 700 12px Arial, sans-serif; }
 .login-page { min-height: 100vh; display: grid; place-items: center; padding: 22px; background: radial-gradient(circle at top right, #dceede, transparent 42%), var(--paper); }
@@ -19,6 +20,7 @@ form { display: grid; gap: 15px; margin-top: 24px; }
 .message { margin: 0 0 15px; padding: 12px 14px; border-radius: 10px; font: 13px/1.4 Arial, sans-serif; }
 .message.error { background: #fde4df; color: #9b3d29; }
 .message.success { background: #e5f2e5; color: #37663e; }
+.message button { margin-top: 9px; padding: 8px 11px; border: 1px solid currentColor; background: transparent; color: inherit; font-size: 12px; }
 .app { min-height: 100vh; padding: 24px 18px 96px; max-width: 760px; margin: 0 auto; }
 .app-header, .screen-header, .today-heading, .section-title, .card-top, .card-meta, .balance-line, .payment-row, .item-row { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
 .app-header { margin-bottom: 25px; }
@@ -39,6 +41,7 @@ form { display: grid; gap: 15px; margin-top: 24px; }
 .delivery-card { width: 100%; display: grid; gap: 11px; margin: 0; padding: 16px; border: 1px solid var(--line); background: var(--card); color: var(--ink); text-align: left; box-shadow: 0 5px 18px rgba(34, 68, 40, .04); }
 .delivery-card + .delivery-card { margin-top: 10px; }
 .delivery-card p { margin: 0; color: var(--muted); font: 13px/1.4 Arial, sans-serif; }
+.vendor-line { margin: 0 0 3px; color: var(--green); font: 700 11px Arial, sans-serif; }
 .card-meta { font: 12px Arial, sans-serif; color: var(--muted); }
 .card-meta strong { color: var(--ink); font-size: 15px; }
 .balance-line { padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted); font: 11px Arial, sans-serif; }
@@ -64,4 +67,9 @@ form { display: grid; gap: 15px; margin-top: 24px; }
 .bottom-nav button { display: grid; gap: 4px; place-items: center; padding: 7px 2px; border-radius: 8px; background: transparent; color: var(--muted); font-size: 10px; }
 .bottom-nav button span { font-size: 18px; }
 .bottom-nav button.active { background: #e9f1e6; color: var(--green); }
+.loading-panel { min-height: 160px; display: grid; place-items: center; color: var(--muted); font: 13px Arial, sans-serif; }
+.action-row button { min-height: 48px; }
+.collection-form button { width: 100%; margin-top: 10px; }
+.payment-status { padding: 8px 10px; border-radius: 8px; background: #eef5ea; }
 @media (min-width: 600px) { .app { padding-top: 42px; } .stats-grid { grid-template-columns: repeat(4, 1fr); } .action-row { grid-template-columns: repeat(3, 1fr); } .login-card { padding: 42px; } }
+@media (max-width: 380px) { .app { padding-right: 14px; padding-left: 14px; } .screen-header { align-items: flex-start; } .screen-header h1 { overflow-wrap: anywhere; font-size: 27px; } .money-grid { grid-template-columns: 1fr; } .action-row { grid-template-columns: 1fr; } .card-top strong { overflow-wrap: anywhere; } }

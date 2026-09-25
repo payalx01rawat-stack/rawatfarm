@@ -17,13 +17,20 @@ export default function ProductDetails() {
   const [message, setMessage] = useState("")
   const [error, setError] = useState("")
 
-  useEffect(() => {
-    api<Product[]>("/api/v1/marketplace/products").then((products) => {
+  async function loadProduct() {
+    setError("")
+    try {
+      const products = await api<Product[]>("/api/v1/marketplace/products")
       const found = products.find((item) => item.id === params.id)
       if (!found) throw new Error("Product not found")
       setProduct(found)
-    }).catch((reason) => setError(reason instanceof Error ? reason.message : "Unable to load product"))
-  }, [params.id])
+    } catch (reason) {
+      setProduct(null)
+      setError(reason instanceof Error ? reason.message : "Unable to load product")
+    }
+  }
+
+  useEffect(() => { loadProduct() }, [params.id])
 
   function addToCart() {
     if (!product) return
@@ -35,5 +42,9 @@ export default function ProductDetails() {
     setMessage(`${product.name} added to cart.`)
   }
 
-  return <PortalShell title={product?.name || "Product details"} subtitle={product ? `Sold by ${product.vendor.name}` : "Loading product"} links={[{ label: "Marketplace", href: "/" }, { label: "My orders", href: "/orders" }]}>{error && <StateMessage error>{error}</StateMessage>}{message && <StateMessage>{message}</StateMessage>}{!product && !error ? <StateMessage>Loading product...</StateMessage> : product && <div className="portal-grid"><section className="portal-panel product-detail-image"><MediaImage src={product.imageUrl} alt={product.name} fallback={product.name.slice(0, 1)} /></section><section className="portal-panel"><p className="vendor-name">{product.category.name}</p><h2>{product.name}</h2><p>{product.description || "Quality checked and packed fresh."}</p><p><strong>₹{Number(product.price || 0).toLocaleString("en-IN")}</strong> / {product.unit.code}</p><p className="vendor-name">Vendor: {product.vendor.name}</p><label>Quantity<input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Math.max(1, Math.floor(Number(event.target.value)) || 1))} /></label><div className="portal-actions"><button className="primary" onClick={addToCart}>Add to cart</button><button className="secondary" onClick={() => router.push("/checkout")}>Go to cart</button><button className="secondary" onClick={() => router.back()}>Back</button></div></section></div>}</PortalShell>
+  return <PortalShell title={product?.name || "Product details"} subtitle={product ? `Sold by ${product.vendor.name}` : "A clear view of what you are buying"} links={[{ label: "Marketplace", href: "/" }, { label: "My orders", href: "/orders" }]}>
+    {error && <StateMessage error>{error}<br /><button onClick={loadProduct}>Try again</button></StateMessage>}
+    {message && <StateMessage>{message}</StateMessage>}
+    {!product && !error ? <section className="portal-panel skeleton" aria-label="Loading product" /> : product && <div className="portal-grid"><section className="portal-panel product-detail-image"><MediaImage src={product.imageUrl} alt={product.name} fallback={product.name.slice(0, 1)} /></section><section className="portal-panel product-detail-copy"><p className="vendor-name">{product.category.name}</p><h2>{product.name}</h2><p className="product-detail-description">{product.description || "Quality checked and packed fresh."}</p><div className="product-detail-price"><strong>₹{Number(product.price || 0).toLocaleString("en-IN")}</strong><span>per {product.unit.code}</span></div><p className="vendor-name">Sold by {product.vendor.name}</p><label>Quantity<input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Math.max(1, Math.floor(Number(event.target.value)) || 1))} aria-describedby="quantity-help" /></label><small id="quantity-help" className="muted">You can adjust this later in your cart.</small><div className="portal-actions"><button className="primary" onClick={addToCart}>Add to cart</button><button className="secondary" onClick={() => router.push("/checkout")}>Go to cart</button><button className="secondary" onClick={() => router.push("/")}>Continue shopping</button></div></section></div>}
+  </PortalShell>
 }
