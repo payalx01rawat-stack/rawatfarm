@@ -6,7 +6,7 @@ import { sendError } from './http.js';
 import { handleApi } from './routes.js';
 import { productSchema } from './schemas.js';
 
-type RoleName = 'VENDOR' | 'CUSTOMER';
+type RoleName = 'VENDOR' | 'CUSTOMER' | 'SUPER_ADMIN' | 'DELIVERY_PARTNER';
 
 type RouteUser = {
   id: string;
@@ -136,4 +136,71 @@ test('product image URL is optional for catalog products', () => {
   const withoutImage = productSchema.safeParse({ categoryId: 'cmg1234567890abc', unitId: 'cmg1234567890abd', name: 'Fresh Mutton', sku: 'MUTTON-B', imageUrl: null });
   assert.equal(withImage.success, true);
   assert.equal(withoutImage.success, true);
+});
+
+test('super admin can create a pending vendor with a linked vendor owner', async () => {
+  const admin = { id: 'admin-a', roles: ['SUPER_ADMIN'] as RoleName[] };
+  const created: Record<string, unknown> = {};
+  const transaction = {
+    user: { create: async ({ data }: { data: Record<string, any> }) => { created.user = data; return { id: 'owner-a', name: data.name, email: data.email, mobile: data.mobile }; } },
+    vendor: { create: async ({ data }: { data: Record<string, any> }) => { created.vendor = data; return { id: 'vendor-new', ...data }; } },
+    vendorUser: { create: async ({ data }: { data: Record<string, any> }) => { created.vendorUser = data; return data; } },
+  };
+  const database = {
+    user: { findUnique: async () => userRecord(admin), findFirst: async () => null },
+    role: { findUnique: async () => ({ id: 'role-vendor' }) },
+    auditLog: { create: async () => undefined },
+    $transaction: async (callback: (tx: typeof transaction) => Promise<unknown>) => callback(transaction),
+  } as never;
+  const output = responseFor();
+  await callApi(requestFor('POST', '/api/v1/marketplace/admin/vendors', tokenFor(admin), { businessName: 'New Foods', ownerName: 'New Owner', email: 'owner@new.test', phone: '9999999999', address: 'New Road', password: 'SecureLocal123!' }), output.response, database);
+  const result = output.read();
+  assert.equal(result.statusCode, 201);
+  assert.equal((created.vendor as { status: string }).status, 'PENDING');
+  assert.equal((created.vendor as { isActive: boolean }).isActive, false);
+  assert.equal((created.user as { passwordHash: string }).passwordHash.includes('SecureLocal123!'), false);
+  assert.deepEqual(created.vendorUser, { userId: 'owner-a', vendorId: 'vendor-new', capabilities: ['ADMIN'] });
+});
+
+test('duplicate vendor owner account is rejected', async () => {
+  const admin = { id: 'admin-a', roles: ['SUPER_ADMIN'] as RoleName[] };
+  const database = {
+    user: { findUnique: async () => userRecord(admin), findFirst: async () => ({ id: 'existing-user' }) },
+  } as never;
+  const output = responseFor();
+  await callApi(requestFor('POST', '/api/v1/marketplace/admin/vendors', tokenFor(admin), { businessName: 'Duplicate Foods', ownerName: 'Existing Owner', email: 'owner@existing.test', phone: '9999999998', address: 'Road', password: 'SecureLocal123!' }), output.response, database);
+  assert.equal(output.read().statusCode, 409);
+});
+
+test('admin vendor status transitions approve and suspend with audit records', async () => {
+  const admin = { id: 'admin-a', roles: ['SUPER_ADMIN'] as RoleName[] };
+  let current = { id: 'vendor-new', status: 'PENDING', isActive: false };
+  const database = {
+    user: { findUnique: async () => userRecord(admin) },
+    vendor: { findUnique: async () => current, update: async ({ data }: { data: { status: string; isActive: boolean } }) => { current = { ...current, ...data }; return current; } },
+    auditLog: { create: async () => undefined },
+  } as never;
+  const approve = responseFor();
+  await callApi(requestFor('PATCH', '/api/v1/marketplace/admin/vendors/vendor-new/status', tokenFor(admin), { status: 'APPROVED' }), approve.response, database);
+  assert.equal(approve.read().statusCode, 200);
+  assert.deepEqual(current, { id: 'vendor-new', status: 'APPROVED', isActive: true });
+  const suspend = responseFor();
+  await callApi(requestFor('PATCH', '/api/v1/marketplace/admin/vendors/vendor-new/status', tokenFor(admin), { status: 'SUSPENDED' }), suspend.response, database);
+  assert.equal(suspend.read().statusCode, 200);
+  assert.deepEqual(current, { id: 'vendor-new', status: 'SUSPENDED', isActive: false });
+});
+
+test('suspended vendor and non-admin users cannot manage vendors', async () => {
+  const suspended = { id: 'vendor-a-user', roles: ['VENDOR'] as RoleName[] };
+  const suspendedDatabase = databaseFor(suspended, 'vendor-a', { vendorUser: { findFirst: async () => ({ vendorId: 'vendor-a', vendor: { id: 'vendor-a', status: 'SUSPENDED', isActive: false } }) } });
+  const suspendedOutput = responseFor();
+  await callApi(requestFor('GET', '/api/v1/marketplace/vendors/vendor-a/products', tokenFor(suspended), undefined), suspendedOutput.response, suspendedDatabase);
+  assert.equal(suspendedOutput.read().statusCode, 403);
+
+  for (const role of ['CUSTOMER', 'DELIVERY_PARTNER'] as RoleName[]) {
+    const output = responseFor();
+    const database = { user: { findUnique: async () => userRecord({ id: `${role}-user`, roles: [role] }) } } as never;
+    await callApi(requestFor('POST', '/api/v1/marketplace/admin/vendors', tokenFor({ id: `${role}-user`, roles: [role] }), {}), output.response, database);
+    assert.equal(output.read().statusCode, 403);
+  }
 });

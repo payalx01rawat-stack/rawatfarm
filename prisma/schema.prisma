@@ -13,6 +13,12 @@ enum UserStatus {
   INACTIVE
 }
 
+enum VendorStatus {
+  PENDING
+  APPROVED
+  SUSPENDED
+}
+
 enum AddressType {
   BILLING
   SHIPPING
@@ -203,6 +209,7 @@ model Vendor {
   upiCollectionEnabled Boolean @default(true)
   paymentInstructions String?
   isActive     Boolean      @default(true)
+  status       VendorStatus @default(APPROVED)
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
   users        VendorUser[]

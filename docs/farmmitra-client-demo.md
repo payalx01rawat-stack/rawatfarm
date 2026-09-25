@@ -111,6 +111,17 @@ Log in as Vendor B and demonstrate only safe read/update checks:
 
 Do not perform destructive operations. The expected result demonstrates that vendor isolation is enforced by the backend authorization layer.
 
+## Vendor Onboarding Demo
+
+The Super Admin marketplace screen at `http://localhost:3002/marketplace` manages vendor lifecycle and setup:
+
+1. Search or filter vendor accounts by business name or status.
+2. Create a vendor with owner contact details and an initial local-development password.
+3. Review the new account's setup checklist and approve it when ready.
+4. Suspend or reapprove an account as its operational state changes.
+
+New accounts begin as `PENDING` and remain hidden from public marketplace discovery until approved. Suspended accounts retain their products, orders, delivery history, and payments, but cannot perform normal vendor operations. The owner uses the existing vendor login and portal after approval; passwords are hashed by the API and are not returned after creation.
+
 ## Delivery Partner Demo
 
 1. Log in as the local delivery partner.

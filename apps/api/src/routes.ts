@@ -3,7 +3,7 @@ import { Prisma, type PrismaClient } from '@farmmitra/database';
 import { authenticate, hashPassword, HttpError, isDeliveryRole, isVendorRole, requirePermission, signAccessToken, verifyPassword } from './auth.js';
 import { audit } from './audit.js';
 import { pathParts, readJson, sendJson } from './http.js';
-import { addressSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema } from './schemas.js';
+import { addressSchema, adminVendorCreateSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, vendorStatusSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema } from './schemas.js';
 import { DEFAULT_ORDER_CUTOFF, DEFAULT_ORDER_TIMEZONE, ORDER_STATUSES, calculateDeliveryDate, deriveDeliveryStatus, hashRequestPayload, isValidStatusTransition, orderSchema, parseRequestedDeliveryDate, quantityValidationError, type QuantityChange } from './orders.js';
 import { calculateAvailableQuantity, isReservationActionAllowed, parseDecimalQuantity } from './inventory.js';
 import { buildPaymentSummary } from './payment-summary.js';
@@ -41,6 +41,19 @@ const authAndPermission = async (request: IncomingMessage, database: PrismaClien
 
 const isAdminLike = (roles: string[]): boolean => roles.some((role) => ['SUPER_ADMIN', 'ADMIN', 'MANAGER'].includes(role));
 
+const isVendorOperational = (vendor: { status?: string; isActive?: boolean }): boolean => vendor.status === 'APPROVED' && vendor.isActive !== false;
+
+const vendorSetup = (vendor: { name: string; address?: string | null; contactPhone?: string | null; contactEmail?: string | null; upiId?: string | null; paymentInstructions?: string | null; products?: unknown[]; users?: Array<{ isActive: boolean; capabilities: unknown }> }) => {
+  const checks = {
+    businessProfile: Boolean(vendor.name && (vendor.contactPhone || vendor.contactEmail)),
+    address: Boolean(vendor.address),
+    paymentSettings: Boolean(vendor.upiId || vendor.paymentInstructions),
+    firstProduct: Boolean(vendor.products?.length),
+    deliverySetup: Boolean(vendor.users?.some((user) => user.isActive && Array.isArray(user.capabilities) && user.capabilities.includes('DELIVERY'))),
+  };
+  return { checks, complete: Object.values(checks).every(Boolean) };
+};
+
 const ensureShopAccess = async (context: Awaited<ReturnType<typeof authenticate>>, database: PrismaClient, shopId: string): Promise<void> => {
   if (isAdminLike(context.roles)) return;
   const access = await database.shopUser.findUnique({ where: { userId_shopId: { userId: context.userId, shopId } } });
@@ -51,9 +64,10 @@ const vendorIdForContext = async (context: Awaited<ReturnType<typeof authenticat
   if (context.roles.includes('SUPER_ADMIN') || context.roles.includes('ADMIN')) return undefined;
   if (isDeliveryRole(context.roles)) return undefined;
   if (!isVendorRole(context.roles)) throw new HttpError(403, 'Vendor access is required');
-  const access = await database.vendorUser.findFirst({ where: { userId: context.userId }, select: { vendorId: true } });
+  const access = await database.vendorUser.findFirst({ where: { userId: context.userId, isActive: true }, include: { vendor: { select: { id: true, status: true, isActive: true } } } });
   if (!access) throw new HttpError(403, 'Vendor access is required');
-  return access.vendorId;
+  if (access.vendor && !isVendorOperational(access.vendor)) throw new HttpError(403, 'Vendor account is not approved for operations');
+  return access.vendor?.id ?? access.vendorId;
 };
 
 const ensureAssignedDelivery = async (database: PrismaClient, orderId: string, userId: string) => {
@@ -425,8 +439,9 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
   if (parts[2] === 'marketplace') {
     if (method === 'GET' && parts[3] === 'me' && parts.length === 4) {
       const context = await authenticate(request, database);
-      const access = await database.vendorUser.findFirst({ where: { userId: context.userId }, include: { vendor: true } });
-      sendJson(response, 200, { userId: context.userId, roles: context.roles, vendor: access?.vendor ?? null, capabilities: access?.capabilities ?? [] });
+      const access = await database.vendorUser.findFirst({ where: { userId: context.userId, isActive: true }, include: { vendor: { include: { products: { where: { status: 'ACTIVE' }, select: { id: true } }, users: { select: { isActive: true, capabilities: true } } } } } });
+      const vendor = access?.vendor ?? null;
+      sendJson(response, 200, { userId: context.userId, roles: context.roles, vendor: vendor ? { ...vendor, setup: vendorSetup(vendor) } : null, capabilities: access?.capabilities ?? [] });
       return true;
     }
 
@@ -434,7 +449,49 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       const context = await authAndPermission(request, database, 'vendors.manage');
       if (!context.roles.includes('SUPER_ADMIN') && !context.roles.includes('ADMIN')) throw new HttpError(403, 'Super admin access is required');
       if (method === 'GET' && parts[4] === 'vendors' && parts.length === 5) {
-        sendJson(response, 200, await database.vendor.findMany({ include: { _count: { select: { products: true, orders: true, users: true } } }, orderBy: { createdAt: 'desc' } }));
+        const query = new URL(request.url ?? '/', 'http://localhost');
+        const search = query.searchParams.get('search')?.trim();
+        const status = query.searchParams.get('status');
+        const vendors = await database.vendor.findMany({ where: { ...(status ? { status: status as never } : {}), ...(search ? { OR: [{ name: { contains: search } }, { contactEmail: { contains: search } }, { contactPhone: { contains: search } }] } : {}) }, include: { products: { where: { status: 'ACTIVE' }, select: { id: true } }, users: { select: { isActive: true, capabilities: true } }, _count: { select: { products: true, orders: true, users: true } } }, orderBy: { createdAt: 'desc' } });
+        sendJson(response, 200, vendors.map((vendor) => ({ ...vendor, setup: vendorSetup(vendor) })));
+        return true;
+      }
+      if (method === 'POST' && parts[4] === 'vendors' && parts.length === 5) {
+        const input = await body(request, adminVendorCreateSchema);
+        const duplicate = await database.user.findFirst({ where: { OR: [{ email: input.email }, { mobile: input.phone }] }, select: { id: true } });
+        if (duplicate) throw new HttpError(409, 'An account with that email or phone already exists');
+        const role = await database.role.findUnique({ where: { name: 'VENDOR' } });
+        if (!role) throw new HttpError(500, 'Vendor role is not configured');
+        const created = await database.$transaction(async (tx) => {
+          const user = await tx.user.create({ data: { name: input.ownerName, email: input.email, mobile: input.phone, passwordHash: await hashPassword(input.password), roles: { create: [{ roleId: role.id }] } } });
+          const vendor = await tx.vendor.create({ data: { name: input.businessName, contactEmail: input.email, contactPhone: input.phone, address: input.address, isActive: false, status: 'PENDING' } });
+          await tx.vendorUser.create({ data: { userId: user.id, vendorId: vendor.id, capabilities: ['ADMIN'] } });
+          return { vendor, user: { id: user.id, name: user.name, email: user.email, mobile: user.mobile } };
+        });
+        await audit(database, context.userId, 'CREATE', 'Vendor', created.vendor.id, { ownerUserId: created.user.id, status: 'PENDING' });
+        sendJson(response, 201, created);
+        return true;
+      }
+      if (parts[4] === 'vendors' && parts.length === 6) {
+        const vendorId = idFrom(parts, 5);
+        const vendor = await database.vendor.findUnique({ where: { id: vendorId }, include: { products: { where: { status: 'ACTIVE' }, select: { id: true } }, users: { select: { isActive: true, capabilities: true } }, _count: { select: { products: true, orders: true, users: true } } } });
+        if (!vendor) throw new HttpError(404, 'Vendor not found');
+        if (method === 'GET') {
+          sendJson(response, 200, { ...vendor, setup: vendorSetup(vendor) });
+          return true;
+        }
+      }
+      if (method === 'PATCH' && parts[4] === 'vendors' && parts.length === 7 && parts[6] === 'status') {
+        const vendorId = idFrom(parts, 5);
+        const vendor = await database.vendor.findUnique({ where: { id: vendorId } });
+        if (!vendor) throw new HttpError(404, 'Vendor not found');
+        const input = await body(request, vendorStatusSchema);
+        if (vendor.status === input.status) throw new HttpError(400, 'Vendor is already in that status');
+        const validTransition = (vendor.status === 'PENDING' && ['APPROVED', 'SUSPENDED'].includes(input.status)) || (vendor.status === 'APPROVED' && input.status === 'SUSPENDED') || (vendor.status === 'SUSPENDED' && input.status === 'APPROVED');
+        if (!validTransition) throw new HttpError(400, 'Invalid vendor status transition');
+        const updated = await database.vendor.update({ where: { id: vendorId }, data: { status: input.status as never, isActive: input.status === 'APPROVED' } });
+        await audit(database, context.userId, 'UPDATE', 'Vendor', vendorId, { previousStatus: vendor.status, status: input.status });
+        sendJson(response, 200, updated);
         return true;
       }
       if (method === 'GET' && parts[4] === 'master-orders' && parts.length === 5) {
@@ -588,7 +645,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       const query = new URL(request.url ?? '/', 'http://localhost');
       const search = query.searchParams.get('search')?.trim();
       const products = await database.product.findMany({
-        where: { status: 'ACTIVE', vendor: { is: { isActive: true } }, ...(search ? { OR: [{ name: { contains: search } }, { description: { contains: search } }] } : {}) },
+        where: { status: 'ACTIVE', vendor: { is: { isActive: true, status: 'APPROVED' } }, ...(search ? { OR: [{ name: { contains: search } }, { description: { contains: search } }] } : {}) },
         include: { vendor: true, category: true, unit: true, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
         orderBy: { name: 'asc' },
       });
@@ -598,7 +655,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     }
 
     if (method === 'GET' && parts[3] === 'vendors' && parts.length === 4) {
-      sendJson(response, 200, await database.vendor.findMany({ where: { isActive: true }, orderBy: { name: 'asc' } }));
+      sendJson(response, 200, await database.vendor.findMany({ where: { isActive: true, status: 'APPROVED' }, orderBy: { name: 'asc' } }));
       return true;
     }
 
