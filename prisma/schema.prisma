@@ -218,12 +218,14 @@ model VendorUser {
   userId       String
   vendorId     String
   capabilities Json?
+  isActive     Boolean  @default(true)
   assignedAt   DateTime @default(now())
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   vendor        Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
 
   @@id([userId, vendorId])
   @@index([vendorId])
+  @@index([vendorId, isActive])
 }
 
 model CustomerAddress {
@@ -631,6 +633,9 @@ model DeliveryAssignment {
   assignedAt DateTime @default(now())
   delivery   Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
   user       User     @relation(fields: [userId], references: [id])
+
+  @@index([userId, assignedAt])
+  @@index([deliveryId, status])
 }
 
 model DeliveryItem {

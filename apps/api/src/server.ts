@@ -9,7 +9,7 @@ const database = new PrismaClient();
 
 const corsHeaders = {
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key',
 };
 
 const server = createServer(async (request, response) => {

@@ -40,6 +40,7 @@ export default function DeliveryOrderDetail() {
 
   async function action(name: string, body?: object) {
     try {
+      if (name === "start" && delivery?.order.status === "ASSIGNED") await api(`/api/v1/marketplace/delivery/orders/${params.id}/accept`, { method: "POST", body: "{}" })
       await api(`/api/v1/marketplace/delivery/orders/${params.id}/${name}`, { method: "POST", body: JSON.stringify(body || {}) })
       setMessage(name === "complete" ? "Delivery and payment status updated." : `Delivery ${name}ed.`)
       load()

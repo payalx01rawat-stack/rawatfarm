@@ -3,9 +3,10 @@ import { Prisma, type PrismaClient } from '@farmmitra/database';
 import { authenticate, hashPassword, HttpError, isDeliveryRole, isVendorRole, requirePermission, signAccessToken, verifyPassword } from './auth.js';
 import { audit } from './audit.js';
 import { pathParts, readJson, sendJson } from './http.js';
-import { addressSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema } from './schemas.js';
+import { addressSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema } from './schemas.js';
 import { DEFAULT_ORDER_CUTOFF, DEFAULT_ORDER_TIMEZONE, ORDER_STATUSES, calculateDeliveryDate, deriveDeliveryStatus, hashRequestPayload, isValidStatusTransition, orderSchema, parseRequestedDeliveryDate, quantityValidationError, type QuantityChange } from './orders.js';
 import { calculateAvailableQuantity, isReservationActionAllowed, parseDecimalQuantity } from './inventory.js';
+import { buildPaymentSummary } from './payment-summary.js';
 
 const body = async <T>(request: IncomingMessage, schema: { parse(value: unknown): T }): Promise<T> => {
   try {
@@ -48,6 +49,7 @@ const ensureShopAccess = async (context: Awaited<ReturnType<typeof authenticate>
 
 const vendorIdForContext = async (context: Awaited<ReturnType<typeof authenticate>>, database: PrismaClient): Promise<string | undefined> => {
   if (context.roles.includes('SUPER_ADMIN') || context.roles.includes('ADMIN')) return undefined;
+  if (isDeliveryRole(context.roles)) return undefined;
   if (!isVendorRole(context.roles)) throw new HttpError(403, 'Vendor access is required');
   const access = await database.vendorUser.findFirst({ where: { userId: context.userId }, select: { vendorId: true } });
   if (!access) throw new HttpError(403, 'Vendor access is required');
@@ -449,6 +451,42 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       }
     }
 
+    if (parts[3] === 'delivery' && ['dashboard', 'payments', 'history', 'outstanding'].includes(parts[4] ?? '') && parts.length === 5) {
+      const context = await authenticate(request, database);
+      if (!isDeliveryRole(context.roles) && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Delivery partner access is required');
+      const deliveries = await database.delivery.findMany({ where: context.roles.includes('SUPER_ADMIN') ? {} : { assignments: { some: { userId: context.userId } } }, include: { order: { include: { vendor: true, items: true, payments: true } }, assignments: { include: { user: true } } }, orderBy: { scheduledAt: 'asc' } });
+      const payments = await database.payment.findMany({ where: context.roles.includes('SUPER_ADMIN') ? {} : { deliveryPartnerId: context.userId }, include: { order: true, vendor: true, deliveryPartner: true }, orderBy: { receivedAt: 'desc' } });
+      const summaries = deliveries.map((delivery) => ({ ...delivery, paymentSummary: buildPaymentSummary(delivery.order.totalAmount, delivery.order.payments, delivery.order.orderDate) }));
+      if (parts[4] === 'payments') {
+        sendJson(response, 200, { payments, totals: payments.reduce((result, payment) => { if (!payment.status || !['COMPLETED', 'CASH_COLLECTED', 'UPI_COLLECTED'].includes(payment.status)) return result; result.total += Number(payment.amount); if (payment.method === 'CASH') result.cash += Number(payment.amount); if (payment.method === 'UPI') result.upi += Number(payment.amount); return result; }, { total: 0, cash: 0, upi: 0 }) });
+        return true;
+      }
+      if (parts[4] === 'outstanding') {
+        sendJson(response, 200, summaries.filter((delivery) => delivery.paymentSummary.outstanding > 0));
+        return true;
+      }
+      if (parts[4] === 'history') {
+        sendJson(response, 200, summaries);
+        return true;
+      }
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayPayments = payments.filter((payment) => payment.receivedAt && new Date(payment.receivedAt) >= today);
+      sendJson(response, 200, {
+        deliveries: summaries,
+        today: {
+          assigned: summaries.length,
+          pending: summaries.filter((delivery) => delivery.order.status !== 'DELIVERED').length,
+          completed: summaries.filter((delivery) => delivery.order.status === 'DELIVERED').length,
+          collected: todayPayments.reduce((sum, payment) => sum + Number(payment.amount), 0),
+          cash: todayPayments.filter((payment) => payment.method === 'CASH').reduce((sum, payment) => sum + Number(payment.amount), 0),
+          upi: todayPayments.filter((payment) => payment.method === 'UPI').reduce((sum, payment) => sum + Number(payment.amount), 0),
+          outstanding: summaries.reduce((sum, delivery) => sum + delivery.paymentSummary.outstanding, 0),
+        },
+      });
+      return true;
+    }
+
     if (parts[3] === 'addresses') {
       const context = await authenticate(request, database);
       if (method === 'GET' && parts.length === 4) {
@@ -504,12 +542,15 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         }
         if (method === 'POST' && parts.length === 7) {
           const action = parts[6];
+          const assignment = delivery.assignments.find((item) => item.userId === context.userId);
           if (action === 'accept') {
+            if (!assignment) throw new HttpError(403, 'This delivery is not assigned to you');
             const updated = await database.deliveryAssignment.updateMany({ where: { deliveryId: delivery.id, userId: context.userId }, data: { status: 'ACCEPTED' } });
             sendJson(response, 200, updated);
             return true;
           }
           if (action === 'start') {
+            if (assignment?.status !== 'ACCEPTED' && assignment?.status !== 'IN_PROGRESS') throw new HttpError(400, 'Accept the delivery before starting it');
             if (delivery.order.status !== 'ASSIGNED') throw new HttpError(400, 'Order is not ready for delivery');
             await database.$transaction([
               database.deliveryAssignment.updateMany({ where: { deliveryId: delivery.id, userId: context.userId }, data: { status: 'IN_PROGRESS' } }),
@@ -525,8 +566,11 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
             const capabilities = Array.isArray(partnerAccess?.capabilities) ? partnerAccess.capabilities : [];
             if ((input.payment === 'CASH' || input.payment === 'UPI') && !context.roles.includes('SUPER_ADMIN') && !capabilities.includes('PAYMENT_COLLECTION')) throw new HttpError(403, 'Payment collection capability is required');
             if (delivery.order.status !== 'OUT_FOR_DELIVERY') throw new HttpError(400, 'Order is not out for delivery');
-            const amount = Number(input.amount ?? delivery.order.totalAmount);
-            if ((input.payment === 'CASH' || input.payment === 'UPI') && amount !== Number(delivery.order.totalAmount)) throw new HttpError(400, 'Collected amount must equal the order total');
+            if (input.payment === 'UPI' && !input.referenceNumber) throw new HttpError(400, 'UPI reference number is required');
+            const paymentSummary = buildPaymentSummary(delivery.order.totalAmount, delivery.order.payments, delivery.order.orderDate);
+            const amount = Number(input.amount ?? paymentSummary.outstanding);
+            if ((input.payment === 'CASH' || input.payment === 'UPI') && amount > paymentSummary.outstanding) throw new HttpError(400, 'Collected amount cannot exceed the outstanding balance');
+            if ((input.payment === 'CASH' || input.payment === 'UPI') && amount <= 0) throw new HttpError(400, 'Collected amount must be greater than zero');
             const result = await database.$transaction(async (tx) => {
               if (input.payment === 'CASH' || input.payment === 'UPI') await tx.payment.create({ data: { shopId: delivery.order.shopId, orderId: delivery.orderId, vendorId: delivery.order.vendorId, amount, method: input.payment, status: input.payment === 'CASH' ? 'CASH_COLLECTED' : 'UPI_COLLECTED', referenceNumber: input.referenceNumber, paidAt: new Date(), receivedAt: new Date(), receivedByUserId: context.userId, deliveryPartnerId: context.userId, notes: input.notes } });
               const updatedDelivery = await tx.delivery.update({ where: { id: delivery.id }, data: { status: 'DELIVERED', deliveredAt: new Date(), deliveredByUserId: context.userId, deliveryNotes: input.notes } });
@@ -598,11 +642,32 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         sendJson(response, 200, await database.vendorUser.findMany({ where: { vendorId }, include: { user: { include: { roles: { include: { role: true } } } } } }));
         return true;
       }
+      if (parts[5] === 'delivery-partners' && parts.length === 7) {
+        const partnerId = idFrom(parts, 6);
+        const existing = await database.vendorUser.findUnique({ where: { userId_vendorId: { userId: partnerId, vendorId } }, include: { user: true, vendor: true } });
+        if (!existing) throw new HttpError(404, 'Delivery partner not found');
+        if (method === 'GET') {
+          sendJson(response, 200, existing);
+          return true;
+        }
+        if (method === 'PATCH') {
+          const input = await body(request, deliveryPartnerUpdateSchema);
+          const updated = await database.vendorUser.update({ where: { userId_vendorId: { userId: partnerId, vendorId } }, data: input, include: { user: true, vendor: true } });
+          sendJson(response, 200, updated);
+          return true;
+        }
+        if (method === 'DELETE') {
+          const updated = await database.vendorUser.update({ where: { userId_vendorId: { userId: partnerId, vendorId } }, data: { isActive: false }, include: { user: true, vendor: true } });
+          sendJson(response, 200, updated);
+          return true;
+        }
+      }
       if (method === 'POST' && parts[5] === 'delivery-partners' && parts.length === 6) {
         const input = await body(request, deliveryPartnerSchema);
-        const user = await database.user.findUnique({ where: { id: input.userId } });
+        const user = await database.user.findUnique({ where: { id: input.userId }, include: { roles: { include: { role: true } } } });
         if (!user || user.status !== 'ACTIVE') throw new HttpError(404, 'Active user not found');
-        sendJson(response, 201, await database.vendorUser.upsert({ where: { userId_vendorId: { userId: input.userId, vendorId } }, update: { capabilities: input.capabilities }, create: { userId: input.userId, vendorId, capabilities: input.capabilities } }));
+        if (!user.roles.some(({ role }) => ['DELIVERY_PARTNER', 'DELIVERY_STAFF'].includes(role.name))) throw new HttpError(400, 'User is not a delivery partner');
+        sendJson(response, 201, await database.vendorUser.upsert({ where: { userId_vendorId: { userId: input.userId, vendorId } }, update: { capabilities: input.capabilities, isActive: true }, create: { userId: input.userId, vendorId, capabilities: input.capabilities } }));
         return true;
       }
       if (method === 'GET' && parts[5] === 'payments' && parts.length === 6) {
@@ -618,11 +683,52 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         sendJson(response, 200, await database.vendor.update({ where: { id: vendorId }, data: settings, select: { id: true, name: true, imageUrl: true, contactPhone: true, contactEmail: true, address: true, upiId: true, paymentDisplayName: true, qrImageUrl: true, cashCollectionEnabled: true, upiCollectionEnabled: true, paymentInstructions: true } }));
         return true;
       }
+      if (parts[5] === 'collections' && parts.length === 6 && method === 'GET') {
+        const payments = await database.payment.findMany({ where: { vendorId }, include: { order: true, deliveryPartner: true, receivedBy: true }, orderBy: { receivedAt: 'desc' } });
+        sendJson(response, 200, { payments, totals: payments.reduce((result, payment) => { if (!['COMPLETED', 'CASH_COLLECTED', 'UPI_COLLECTED'].includes(payment.status)) return result; result.total += Number(payment.amount); if (payment.method === 'CASH') result.cash += Number(payment.amount); if (payment.method === 'UPI') result.upi += Number(payment.amount); return result; }, { total: 0, cash: 0, upi: 0 }) });
+        return true;
+      }
+      if ((parts[5] === 'outstanding' || parts[5] === 'delivery-dashboard') && parts.length === 6 && method === 'GET') {
+        const orders = await database.order.findMany({ where: { vendorId }, include: { payments: true, deliveries: { include: { assignments: { include: { user: true } } } }, items: true }, orderBy: { createdAt: 'desc' } });
+        const summaries = orders.map((vendorOrder) => ({ ...vendorOrder, paymentSummary: buildPaymentSummary(vendorOrder.totalAmount, vendorOrder.payments, vendorOrder.orderDate) }));
+        if (parts[5] === 'outstanding') {
+          sendJson(response, 200, summaries.filter((vendorOrder) => vendorOrder.paymentSummary.outstanding > 0));
+          return true;
+        }
+        const partnerSummary = new Map<string, { userId: string; name: string; deliveries: number; collected: number; cash: number; upi: number }>();
+        for (const vendorOrder of summaries) for (const delivery of vendorOrder.deliveries) for (const assignment of delivery.assignments) {
+          const current = partnerSummary.get(assignment.userId) ?? { userId: assignment.userId, name: assignment.user.name, deliveries: 0, collected: 0, cash: 0, upi: 0 };
+          current.deliveries += 1;
+          current.collected += vendorOrder.paymentSummary.collected;
+          current.cash += vendorOrder.paymentSummary.cashCollected;
+          current.upi += vendorOrder.paymentSummary.upiCollected;
+          partnerSummary.set(assignment.userId, current);
+        }
+        sendJson(response, 200, { orders: summaries, partners: Array.from(partnerSummary.values()), totals: { deliveries: summaries.length, pending: summaries.filter((vendorOrder) => vendorOrder.status !== 'DELIVERED').length, delivered: summaries.filter((vendorOrder) => vendorOrder.status === 'DELIVERED').length, collected: summaries.reduce((sum, vendorOrder) => sum + vendorOrder.paymentSummary.collected, 0), cash: summaries.reduce((sum, vendorOrder) => sum + vendorOrder.paymentSummary.cashCollected, 0), upi: summaries.reduce((sum, vendorOrder) => sum + vendorOrder.paymentSummary.upiCollected, 0), outstanding: summaries.reduce((sum, vendorOrder) => sum + vendorOrder.paymentSummary.outstanding, 0), overdue: summaries.filter((vendorOrder) => vendorOrder.paymentSummary.overdue).length } });
+        return true;
+      }
     }
 
     if (method === 'POST' && parts[3] === 'orders' && parts.length === 4) {
       const context = await authenticate(request, database);
       const input = await body(request, marketplaceOrderSchema);
+      const idempotencyKey = getIdempotencyKey(request);
+      const requestHash = hashRequestPayload(input);
+      if (idempotencyKey) {
+        const existingKey = await database.idempotencyKey.findUnique({ where: { key: idempotencyKey } });
+        if (existingKey && (existingKey.userId !== context.userId || existingKey.requestHash !== requestHash)) {
+          throw new HttpError(409, 'Idempotency key was already used with a different request');
+        }
+        if (existingKey?.orderId) {
+          const existingOrder = await database.order.findUnique({ where: { id: existingKey.orderId }, include: { masterOrder: { include: { subOrders: { include: { vendor: true, items: true } } } } } });
+          const existingMaster = existingOrder?.masterOrder;
+          if (existingMaster) {
+            sendJson(response, 200, existingMaster);
+            return true;
+          }
+        }
+        if (!existingKey) await database.idempotencyKey.create({ data: { key: idempotencyKey, userId: context.userId, requestHash } });
+      }
       const fallbackShop = await database.shop.findFirst({ where: { isActive: true }, orderBy: { createdAt: 'asc' } });
       const branch = await database.warehouse.findFirst({ where: { isActive: true }, select: { branchId: true } });
       if (!fallbackShop || !branch) throw new HttpError(400, 'Marketplace checkout is not configured');
@@ -671,6 +777,10 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         }
         return tx.masterOrder.findUnique({ where: { id: createdMaster.id }, include: { subOrders: { include: { vendor: true, items: true } } } });
       });
+      if (!master) throw new HttpError(500, 'Marketplace order could not be created');
+      const firstSubOrder = master.subOrders[0];
+      if (!firstSubOrder) throw new HttpError(500, 'Marketplace order has no vendor sub-orders');
+      if (idempotencyKey) await database.idempotencyKey.update({ where: { key: idempotencyKey }, data: { orderId: firstSubOrder.id } });
       sendJson(response, 201, master);
       return true;
     }
@@ -700,7 +810,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         if (order.status !== 'PACKED') throw new HttpError(400, 'Order must be packed before assignment');
         const assignee = await database.vendorUser.findUnique({ where: { userId_vendorId: { userId: input.userId, vendorId: order.vendorId } }, include: { user: { include: { roles: { include: { role: true } } } } } });
         const capabilities = Array.isArray(assignee?.capabilities) ? assignee.capabilities : [];
-        if (!assignee || (!assignee.user.roles.some(({ role }) => ['DELIVERY_PARTNER', 'DELIVERY_STAFF'].includes(role.name)) && !capabilities.includes('DELIVERY'))) throw new HttpError(400, 'Active delivery partner is required');
+        if (!assignee?.isActive || assignee.user.status !== 'ACTIVE' || (!assignee.user.roles.some(({ role }) => ['DELIVERY_PARTNER', 'DELIVERY_STAFF'].includes(role.name)) && !capabilities.includes('DELIVERY'))) throw new HttpError(400, 'Active delivery partner is required');
         const delivery = await database.delivery.create({ data: { orderId, shopId: order.shopId, vendorId: order.vendorId, deliveryAddress: order.deliveryAddressSnapshot ?? 'Customer address', scheduledAt: input.deliveryDate ?? order.requestedDeliveryDate, assignments: { create: { userId: input.userId } } } });
         await database.order.update({ where: { id: orderId }, data: { assignedAt: new Date(), status: 'ASSIGNED', statusHistory: { create: [{ previousStatus: order.status, newStatus: 'ASSIGNED', changedBy: context.userId, reason: 'ASSIGN_DELIVERY' }] } } });
         sendJson(response, 201, delivery);
@@ -710,9 +820,12 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       if (method === 'POST' && parts[5] === 'collect-payment' && parts.length === 6) {
         if (!isDeliveryRole(context.roles) && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Payment collection capability is required');
         const input = await body(request, paymentCollectionSchema);
-        if (input.amount > Number(order.totalAmount)) throw new HttpError(400, 'Collected amount cannot exceed the order total');
+        const paymentSummary = buildPaymentSummary(order.totalAmount, order.payments, order.orderDate);
+        if (input.amount > paymentSummary.outstanding) throw new HttpError(400, 'Collected amount cannot exceed the outstanding balance');
+        if (paymentSummary.outstanding <= 0) throw new HttpError(400, 'Order is already fully paid');
+        if (input.method === 'UPI' && !input.referenceNumber) throw new HttpError(400, 'UPI reference number is required');
         const payment = await database.payment.create({ data: { shopId: order.shopId, orderId, vendorId: order.vendorId, amount: input.amount, method: input.method, status: input.method === 'CASH' ? 'CASH_COLLECTED' : 'UPI_COLLECTED', referenceNumber: input.referenceNumber, paidAt: new Date(), receivedAt: new Date(), receivedByUserId: context.userId, deliveryPartnerId: context.userId, notes: input.notes } });
-        sendJson(response, 201, payment);
+        sendJson(response, 201, { payment, summary: buildPaymentSummary(order.totalAmount, [...order.payments, payment], order.orderDate) });
         return true;
       }
 

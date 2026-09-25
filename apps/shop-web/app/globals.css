@@ -370,6 +370,14 @@ button:hover {
 .portal-actions button { margin: 0; padding: 9px 12px; border: 1px solid #ded8ca; border-radius: 5px; background: #fffdf8; color: #1c2a20; font-size: 12px; }
 .portal-actions button.primary { background: #e75d35; border-color: #e75d35; color: white; }
 .portal-empty { padding: 35px 15px; color: #788176; text-align: center; }
+.media-fallback { display: grid; place-items: center; width: 100%; height: 100%; min-height: 100px; color: #78906f; font: 400 65px Georgia, serif; }
+.product-detail-image { min-height: 360px; display: grid; place-items: center; overflow: hidden; }
+.product-detail-image img, .product-detail-image .media-fallback { width: 100%; height: 100%; min-height: 320px; object-fit: cover; }
+.quantity-control { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.quantity-control button { width: 24px; height: 24px; margin: 0; padding: 0; border: 1px solid #657268; background: transparent; color: white; line-height: 1; }
+.quantity-control span { min-width: 18px; text-align: center; }
+.quantity-control em { margin-left: auto; color: #ff8b65; font-size: 12px; font-style: normal; }
+button:disabled { cursor: not-allowed; opacity: .55; }
 @media (max-width: 900px) { .portal-stats { grid-template-columns: repeat(3, 1fr); } .portal-grid { grid-template-columns: 1fr; } }
 @media (max-width: 600px) { .portal-header { flex-wrap: wrap; } .portal-header nav { order: 3; flex-basis: 100%; } .portal-stats { grid-template-columns: repeat(2, 1fr); } .portal-table { min-width: 680px; } .portal-panel { overflow-x: auto; } }
 

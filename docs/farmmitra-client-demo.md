@@ -178,6 +178,7 @@ There is no safe automated reset command in the repository. Do not use `prisma m
 | API | `http://localhost:4000` |
 | Shop frontend | `http://localhost:3000` |
 | Admin frontend | `http://localhost:3002` |
+| Delivery App | `http://localhost:3004` |
 | Health check | `GET http://localhost:4000/health` |
 
 The health response should contain `status: "ok"` and `database: "connected"`.
@@ -202,6 +203,7 @@ From the repository root:
 npm.cmd run dev --workspace @farmmitra/api
 npm.cmd run dev --workspace @farmmitra/shop-web
 npm.cmd run dev --workspace @farmmitra/admin-web
+npm.cmd run dev --workspace @farmmitra/delivery-web
 ```
 
 If port `3000` is occupied, stop only the stale frontend Node process before restarting the shop. The admin frontend can run on `3002` when the shop owns `3000`.
@@ -213,6 +215,7 @@ If port `3000` is occupied, stop only the stale frontend Node process before res
 - [ ] API running on port `4000`
 - [ ] Shop frontend running on port `3000`
 - [ ] Admin frontend running on port `3002`
+- [ ] Delivery App running on port `3004`
 - [ ] `GET /health` returns HTTP 200 with connected database
 - [ ] Customer login works
 - [ ] Vendor login works
@@ -243,7 +246,7 @@ These are intentional current-scope limitations, not claims of unsupported funct
 
 The current verified local baseline is:
 
-- API regression: 20 passed, 0 failed
+- API regression: 23 passed, 0 failed
 - Workspace production build: passed
 - API health: database connected
 - Customer marketplace and product detail: verified through live local HTTP/API checks
