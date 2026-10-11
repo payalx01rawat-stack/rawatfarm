@@ -1,6 +1,6 @@
 ﻿import type { CapacitorConfig } from '@capacitor/cli';
 
-const serverUrl = process.env..trim();
+const serverUrl = process.env.FARMMITRA_DELIVERY_URL?.trim();
 
 const config: CapacitorConfig = {
   appId: 'in.farmmitra.delivery',
