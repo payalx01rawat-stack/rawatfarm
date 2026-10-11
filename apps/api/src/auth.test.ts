@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ServerResponse } from 'node:http';
-import { hashPassword, ROLE_NAMES, verifyPassword } from './auth.js';
+import type { PrismaClient } from '@farmmitra/database';
+import jwt from 'jsonwebtoken';
+import { authenticate, hashPassword, HttpError, ROLE_NAMES, signAccessToken, verifyPassword } from './auth.js';
+import { config } from '@farmmitra/config';
 import { isAllowedOrigin, sendError } from './http.js';
 import { loginSchema, registerSchema } from './schemas.js';
 
@@ -29,6 +32,47 @@ test('marketplace roles are exposed for vendor, customer and delivery access', (
   assert.equal(ROLE_NAMES.includes('VENDOR'), true);
   assert.equal(ROLE_NAMES.includes('CUSTOMER'), true);
   assert.equal(ROLE_NAMES.includes('DELIVERY_PARTNER'), true);
+});
+
+test('active customer bearer token is accepted by API authentication', async () => {
+  const database = {
+    user: {
+      findUnique: async ({ where }: { where: { id: string } }) => ({
+        id: where.id,
+        status: 'ACTIVE',
+        roles: [{ role: { name: 'CUSTOMER', permissions: [] } }],
+      }),
+    },
+  } as unknown as PrismaClient;
+  const accessToken = signAccessToken({ userId: 'customer-test-id', roles: ['CUSTOMER'], permissions: [] });
+
+  const context = await authenticate({ headers: { authorization: `Bearer ${accessToken}` } }, database);
+
+  assert.deepEqual(context, {
+    userId: 'customer-test-id',
+    roles: ['CUSTOMER'],
+    permissions: [],
+  });
+});
+
+test('API authentication rejects missing, invalid, and expired bearer tokens', async () => {
+  const database = {
+    user: {
+      findUnique: async () => ({
+        id: 'customer-test-id',
+        status: 'ACTIVE',
+        roles: [{ role: { name: 'CUSTOMER', permissions: [] } }],
+      }),
+    },
+  } as unknown as PrismaClient;
+  const expiredToken = jwt.sign({ sub: 'customer-test-id' }, config.JWT_SECRET, { expiresIn: -1 });
+
+  for (const authorization of [undefined, 'Bearer invalid-token', `Bearer ${expiredToken}`]) {
+    await assert.rejects(
+      authenticate({ headers: authorization ? { authorization } : {} }, database),
+      (error: unknown) => error instanceof HttpError && error.statusCode === 401,
+    );
+  }
 });
 
 test('local storefront and admin origins are allowed for browser requests', () => {

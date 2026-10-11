@@ -22,7 +22,7 @@ An assigned delivery partner moves the order through its delivery lifecycle and 
 
 ### Admin
 
-An authorized admin oversees marketplace-level vendor, order, and collection information.
+An authorized admin enrolls customers, manages their account access, sets vendor/product base rates and customer-specific prices, and oversees marketplace-level vendor, order, and collection information.
 
 ### Security
 
@@ -46,6 +46,8 @@ Local demo password for all accounts: `FarmMitraLocal123!`
 
 ## Customer Experience
 
+Customer accounts are enrolled by an administrator; the Shop does not offer public signup. Use an existing active customer account or have an administrator create/activate the account and securely provide its initial or reset password.
+
 1. Open the shop at `http://localhost:3000`.
 2. Log in with the local customer account through the existing shop login flow.
 3. Browse the marketplace homepage.
@@ -64,7 +66,7 @@ Local demo password for all accounts: `FarmMitraLocal123!`
 16. Open order history from the navigation.
 17. Open the new order and review the master order, vendor sub-orders, items, quantities, totals, address, payment, and delivery status.
 
-FarmMitra allows customers to purchase products from multiple vendors through one marketplace and checkout.
+FarmMitra allows enrolled active customers to purchase products from multiple vendors through one marketplace and checkout. The displayed price is the customer's active override for that vendor/product when configured, otherwise it is the vendor/product base rate. Checkout recalculates the applicable price on the server.
 
 ## Multi-Vendor Architecture
 
@@ -145,12 +147,15 @@ The admin frontend runs at `http://localhost:3002` in the current local setup.
 1. Log in as the Super Admin.
 2. Review the dashboard.
 3. Open Products and show the real catalog table.
-4. Open Orders if order records are available.
-5. Open Delivery and show delivery-partner data.
-6. Open Marketplace oversight and show authorized vendor, master-order, and collection visibility.
-7. Explain that admin has authorized marketplace-level visibility while vendor operational data remains protected by role and scope.
+4. Open Customers to enroll an account, activate/deactivate it, or reset its password. Passwords are hashed by the API and are not returned after creation.
+5. Open Pricing, select a shop/vendor, and manage its product base rates.
+6. Select a customer to create or remove customer-specific overrides. The effective price view distinguishes a custom rate from the base-rate fallback.
+7. Open Orders if order records are available.
+8. Open Delivery and show delivery-partner data.
+9. Open Marketplace oversight and show authorized vendor, master-order, and collection visibility.
+10. Explain that admin has authorized marketplace-level visibility while vendor operational data remains protected by role and scope.
 
-Do not describe admin write capabilities that are not present in the current screen.
+Vendors can manage their catalog and stock, but only administrators can set base rates or customer-specific overrides.
 
 ## Current Demo Data
 

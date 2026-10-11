@@ -148,6 +148,10 @@ model User {
   marketplaceOrders MasterOrder[] @relation("MarketplaceOrderCustomer")
   customerAddresses CustomerAddress[]
   stockMovements StockMovement[]
+  cashHandoversSent CashHandover[] @relation("CashHandoverDeliveryPartner")
+  cashHandoversReceived CashHandover[] @relation("CashHandoverReceivedBy")
+  customerProductPrices CustomerProductPrice[]
+  childAdminPermissions ChildAdminPermission[]
 }
 
 model Role {
@@ -163,6 +167,7 @@ model Permission {
   name        String           @unique
   description String?
   roles       RolePermission[]
+  childAdmins ChildAdminPermission[]
 }
 
 model UserRole {
@@ -181,6 +186,16 @@ model RolePermission {
   permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
 
   @@id([roleId, permissionId])
+}
+
+model ChildAdminPermission {
+  userId       String
+  permissionId String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([userId, permissionId])
+  @@index([permissionId])
 }
 
 model Shop {
@@ -214,10 +229,11 @@ model Vendor {
   contactEmail String?
   address      String?
   upiId        String?
+  upiAccountLast4 String? @db.VarChar(4)
   paymentDisplayName String?
   qrImageUrl   String?
   cashCollectionEnabled Boolean @default(true)
-  upiCollectionEnabled Boolean @default(true)
+  upiCollectionEnabled Boolean @default(false)
   paymentInstructions String?
   isActive     Boolean      @default(true)
   status       VendorStatus @default(APPROVED)
@@ -229,6 +245,9 @@ model Vendor {
   deliveries   Delivery[]
   payments     Payment[]
   stockMovements StockMovement[]
+  cashHandovers CashHandover[]
+  customerProductPrices CustomerProductPrice[]
+  customerPricingRule VendorCustomerPricingRule?
 
   @@index([isActive, createdAt])
 }
@@ -403,6 +422,7 @@ model Product {
   lowStockThreshold Decimal         @default(5) @db.Decimal(14, 3)
   trackInventory   Boolean          @default(true)
   stockMovements   StockMovement[]
+  customerPrices   CustomerProductPrice[]
 
   @@index([vendorId, status])
 }
@@ -445,6 +465,34 @@ model ProductPrice {
 
   @@index([productId, shopId, validFrom])
   @@index([variantId, shopId, validFrom])
+}
+
+model CustomerProductPrice {
+  id         String   @id @default(cuid())
+  customerId String
+  vendorId   String
+  productId  String
+  price      Decimal  @db.Decimal(14, 2)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  customer   User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  vendor     Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, vendorId, productId])
+  @@index([vendorId, productId, isActive])
+}
+
+model VendorCustomerPricingRule {
+  id                 String   @id @default(cuid())
+  vendorId           String   @unique
+  percentAdjustment Decimal  @db.Decimal(7, 3)
+  isActive           Boolean  @default(true)
+  effectiveFrom      DateTime @default(now())
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  vendor             Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
 }
 
 model Inventory {
@@ -726,6 +774,25 @@ model Payment {
   @@index([shopId, status, paidAt])
   @@index([receivedByUserId, receivedAt])
   @@index([vendorId, status, receivedAt])
+}
+
+model CashHandover {
+  id                String   @id @default(cuid())
+  handoverNumber    String   @unique
+  vendorId          String
+  deliveryPartnerId String
+  receivedByUserId  String
+  amount            Decimal  @db.Decimal(14, 2)
+  idempotencyKey    String   @unique
+  requestHash       String
+  notes             String?
+  createdAt         DateTime @default(now())
+  vendor            Vendor   @relation(fields: [vendorId], references: [id])
+  deliveryPartner   User     @relation("CashHandoverDeliveryPartner", fields: [deliveryPartnerId], references: [id])
+  receivedBy        User     @relation("CashHandoverReceivedBy", fields: [receivedByUserId], references: [id])
+
+  @@index([vendorId, createdAt])
+  @@index([deliveryPartnerId, createdAt])
 }
 
 model PaymentAllocation {

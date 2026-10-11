@@ -5,12 +5,18 @@ const id = z.string().cuid();
 const password = z.string().min(8).max(128);
 const decimal = z.coerce.number().finite().nonnegative();
 
-const registerFields = { name: z.string().trim().min(2).max(191), email: z.string().email().optional(), mobile: z.string().trim().min(7).max(30).optional(), password, preferredLanguage: z.enum(['en', 'hi']).default('en') };
+const registerFields = { name: z.string().trim().min(2).max(191), email: z.string().email().optional(), mobile: z.string().trim().min(7).max(30).optional(), password, preferredLanguage: z.enum(['en', 'hi', 'hinglish']).default('en') };
 export const registerSchema = z.object(registerFields).refine((value) => value.email || value.mobile, { message: 'Email or mobile is required' });
 export const loginSchema = z.object({ identifier: z.string().trim().min(3), password });
 export const userCreateSchema = z.object({ ...registerFields, roleNames: z.array(z.string().min(1)).default([]) }).refine((value) => value.email || value.mobile, { message: 'Email or mobile is required' });
-export const userUpdateSchema = z.object({ name: z.string().trim().min(2).max(191).optional(), email: z.string().email().nullable().optional(), mobile: z.string().trim().min(7).max(30).nullable().optional(), password: password.optional(), status: z.enum(['ACTIVE', 'INACTIVE']).optional(), preferredLanguage: z.enum(['en', 'hi']).optional() });
-export const languageSchema = z.enum(['en', 'hi']);
+export const userUpdateSchema = z.object({ name: z.string().trim().min(2).max(191).optional(), email: z.string().email().nullable().optional(), mobile: z.string().trim().min(7).max(30).nullable().optional(), password: password.optional(), status: z.enum(['ACTIVE', 'INACTIVE']).optional(), preferredLanguage: z.enum(['en', 'hi', 'hinglish']).optional() });
+export const languageSchema = z.enum(['en', 'hi', 'hinglish']);
+export const languagePreferenceSchema = z.object({ preferredLanguage: languageSchema });
+export const cashHandoverSchema = z.object({
+  deliveryPartnerId: id,
+  amount: z.coerce.number().finite().positive(),
+  notes: z.string().trim().max(1000).optional(),
+}).strict();
 export const quantitySchema = z.object({ quantity: z.coerce.number().finite().nonnegative(), notes: z.string().trim().max(1000).optional() });
 export const assignmentSchema = z.object({ userId: id, deliveryDate: z.coerce.date().optional(), status: z.string().trim().min(1).max(30).optional() });
 export const shopUserSchema = z.object({ userId: id });
@@ -22,15 +28,49 @@ export const addressSchema = z.object({ type: z.enum(['BILLING', 'SHIPPING', 'BO
 export const creditSchema = z.object({ creditLimit: decimal, paymentTermsDays: z.number().int().nonnegative().max(365), isBlocked: z.boolean().optional() });
 export const categorySchema = z.object({ name: z.string().trim().min(2).max(191), description: z.string().trim().max(191).optional(), isActive: z.boolean().optional() });
 export const unitSchema = z.object({ name: z.string().trim().min(1).max(191), code: z.string().trim().min(1).max(30), precision: z.number().int().nonnegative().max(6), isActive: z.boolean().optional() });
-export const productSchema = z.object({ categoryId: id, unitId: id, name: z.string().trim().min(2).max(191), sku: z.string().trim().min(1).max(191), description: z.string().trim().max(191).optional(), imageUrl: z.string().url().nullable().optional(), status: z.enum(['ACTIVE', 'INACTIVE']).optional(), minOrderQuantity: decimal.optional() });
+export const productSchema = z.object({ categoryId: id, unitId: id, name: z.string().trim().min(2).max(191), sku: z.string().trim().min(1).max(191), description: z.string().trim().max(191).optional(), imageUrl: z.string().url().nullable().optional(), status: z.enum(['ACTIVE', 'INACTIVE']).optional(), minOrderQuantity: decimal.nullable().optional() });
+export const vendorProductCreateSchema = productSchema.extend({ initialStockQuantity: decimal.optional() }).strict();
+export const adminProductCreateSchema = productSchema.extend({ price: decimal.refine((value) => value > 0).optional(), initialStockQuantity: decimal.optional(), trackInventory: z.boolean().optional() }).strict().superRefine((value, context) => {
+  if (value.trackInventory === false && (value.initialStockQuantity ?? 0) > 0) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['initialStockQuantity'], message: 'Initial stock must be zero when inventory tracking is disabled' });
+  }
+});
+export const adminProductUpdateSchema = productSchema.partial().extend({ price: decimal.refine((value) => value > 0).optional(), trackInventory: z.boolean().optional() });
+export const adminMarketplaceBasePriceSchema = z.object({ vendorId: id, productId: id, price: decimal }).strict();
+export const adminCustomerPriceSchema = z.object({ customerId: id, vendorId: id, productId: id, price: decimal }).strict();
+export const automaticCustomerPricingRuleSchema = z.object({
+  vendorId: id,
+  percentAdjustment: z.coerce.number().finite().min(-100).max(1000),
+  isActive: z.boolean(),
+}).strict();
+export const childAdminPermissionNames = [
+  'users.read',
+  'shops.read',
+  'catalog.categories.read',
+  'catalog.units.read',
+  'catalog.products.read',
+  'catalog.products.create',
+  'catalog.products.update',
+  'catalog.prices.read',
+  'catalog.prices.create',
+  'catalog.prices.update',
+  'orders.read',
+] as const;
+export const childAdminPermissionsSchema = z.object({
+  permissionNames: z.array(z.enum(childAdminPermissionNames)).max(childAdminPermissionNames.length),
+}).strict();
 export const stockAdjustmentSchema = z.object({ quantity: z.coerce.number().finite().gt(0), direction: z.enum(['INCREASE', 'DECREASE']), reason: z.string().trim().min(1).max(191), trackInventory: z.boolean().optional(), lowStockThreshold: z.coerce.number().finite().nonnegative().optional() }).strict();
 export const productUpdateSchema = productSchema.partial();
 export const variantSchema = z.object({ productId: id, unitId: id, name: z.string().trim().min(1).max(191), sku: z.string().trim().min(1).max(191), status: z.enum(['ACTIVE', 'INACTIVE']).optional() });
 export const priceSchema = z.object({ productId: id.optional(), variantId: id.optional(), shopId: id.optional(), price: decimal, minQuantity: decimal.optional(), validFrom: z.coerce.date(), validTo: z.coerce.date().nullable().optional() }).refine((value) => value.productId || value.variantId, { message: 'Product or variant is required' });
 export const customerAddressSchema = z.object({ label: z.string().trim().max(80).optional(), line1: z.string().trim().min(1).max(191), line2: z.string().trim().max(191).optional(), city: z.string().trim().min(1).max(191), state: z.string().trim().min(1).max(191), postalCode: z.string().trim().min(3).max(30) });
-export const vendorSchema = z.object({ name: z.string().trim().min(2).max(191), imageUrl: z.string().url().optional(), contactPhone: z.string().trim().max(30).optional(), contactEmail: z.string().email().optional(), address: z.string().trim().max(500).optional(), upiId: z.string().trim().max(191).nullable().optional(), paymentDisplayName: z.string().trim().max(191).nullable().optional(), qrImageUrl: z.string().url().nullable().optional(), cashCollectionEnabled: z.boolean().optional(), upiCollectionEnabled: z.boolean().optional(), paymentInstructions: z.string().trim().max(1000).nullable().optional(), isActive: z.boolean().optional() });
+export const upiIdSchema = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}@[A-Za-z][A-Za-z0-9.-]{1,63}$/, 'Enter a valid UPI ID/VPA');
+export const vendorSchema = z.object({ name: z.string().trim().min(2).max(191), imageUrl: z.string().url().optional(), contactPhone: z.string().trim().max(30).optional(), contactEmail: z.string().email().optional(), address: z.string().trim().max(500).optional(), upiId: upiIdSchema.nullable().optional(), upiAccountLast4: z.string().regex(/^\d{4}$/, 'Enter exactly four account digits').nullable().optional(), paymentDisplayName: z.string().trim().max(191).nullable().optional(), qrImageUrl: z.string().url().nullable().optional(), cashCollectionEnabled: z.boolean().optional(), upiCollectionEnabled: z.boolean().optional(), paymentInstructions: z.string().trim().max(1000).nullable().optional(), isActive: z.boolean().optional() });
 export const vendorSettingsSchema = vendorSchema.partial();
-export const adminVendorCreateSchema = z.object({ businessName: z.string().trim().min(2).max(191), ownerName: z.string().trim().min(2).max(191), email: z.string().email(), phone: z.string().trim().min(7).max(30), address: z.string().trim().min(1).max(500), password: z.string().min(8).max(128) });
+export const adminVendorCreateSchema = z.union([
+  z.object({ businessName: z.string().trim().min(2).max(191), ownerName: z.string().trim().min(2).max(191), email: z.string().email(), phone: z.string().trim().min(7).max(30), address: z.string().trim().min(1).max(500), password: z.string().min(8).max(128) }),
+  z.object({ businessName: z.string().trim().min(2).max(191), ownerUserId: id, address: z.string().trim().min(1).max(500).optional() }),
+]);
 export const vendorStatusSchema = z.object({ status: z.enum(['PENDING', 'APPROVED', 'SUSPENDED']) });
 export const marketplaceOrderSchema = z.object({ items: z.array(orderItemSchema).min(1), notes: z.string().trim().max(1000).optional(), addressId: id.optional(), deliveryAddress: customerAddressSchema.optional() }).strict();
 export const paymentCollectionSchema = z.object({ method: z.enum(['CASH', 'UPI']), amount: z.coerce.number().finite().gt(0), referenceNumber: z.string().trim().max(191).optional(), notes: z.string().trim().max(1000).optional() });

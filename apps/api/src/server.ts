@@ -2,10 +2,12 @@
 import { config } from '@farmmitra/config';
 import { PrismaClient } from '@farmmitra/database';
 import type { HealthStatus } from '@farmmitra/shared-types';
-import { isAllowedOrigin, sendError } from './http.js';
+import { isAllowedOrigin, sendError, setSecurityHeaders } from './http.js';
+import { createApiRateLimiter } from './rate-limit.js';
 import { handleApi } from './routes.js';
 
 const database = new PrismaClient();
+const rateLimit = createApiRateLimiter(config);
 
 const corsHeaders = {
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, PUT, DELETE, OPTIONS',
@@ -14,6 +16,7 @@ const corsHeaders = {
 
 const server = createServer(async (request, response) => {
   try {
+    setSecurityHeaders(response);
     const origin = request.headers.origin;
 
     if (typeof origin === 'string' && isAllowedOrigin(origin)) {
@@ -30,6 +33,8 @@ const server = createServer(async (request, response) => {
       response.end();
       return;
     }
+
+    if (rateLimit(request, response)) return;
 
     if (request.method === 'GET' && request.url === '/health') {
       let databaseStatus: HealthStatus['database'] = 'connected';

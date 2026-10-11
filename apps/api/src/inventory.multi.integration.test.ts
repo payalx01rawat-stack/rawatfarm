@@ -31,12 +31,13 @@ test('database-backed multi-vendor, variant, rollback, and retry inventory behav
   const vendorA = await prisma.vendor.findFirstOrThrow({ where: { name: 'Vendor A' } });
   const vendorB = await prisma.vendor.findFirstOrThrow({ where: { name: 'Vendor B' } });
   const customer = await prisma.user.findFirstOrThrow({ where: { email: 'customer.local@farmmitra.test' } });
+  const vendorAUser = await prisma.user.findFirstOrThrow({ where: { email: 'vendor.a@farmmitra.test' } });
   const vendorBUser = await prisma.user.findFirstOrThrow({ where: { email: 'vendor.b@farmmitra.test' } });
   const deliveryUser = await prisma.user.findFirstOrThrow({ where: { email: 'rahul.delivery@farmmitra.test' } });
   const admin = await prisma.user.findFirstOrThrow({ where: { email: 'admin.local@farmmitra.test' } });
   const category = await prisma.category.findFirstOrThrow({ where: { name: 'Fresh Foods' } });
   const unit = await prisma.unit.findFirstOrThrow({ where: { code: 'KG' } });
-  const fixtureSkus = ['PHASE3-MULTI-A', 'PHASE3-MULTI-B', 'PHASE3-ROLLBACK-B', 'PHASE3-VARIANT-A'];
+  const fixtureSkus = ['PHASE3-MULTI-A', 'PHASE3-MULTI-B', 'PHASE3-ROLLBACK-B', 'PHASE3-VARIANT-A', 'PHASE3-VENDOR-CREATE'];
   const staleProducts = await prisma.product.findMany({ where: { sku: { in: fixtureSkus } }, select: { id: true } });
   const staleOrders = await prisma.order.findMany({ where: { items: { some: { productId: { in: staleProducts.map((product) => product.id) } } } }, select: { id: true, masterOrderId: true } });
   await prisma.payment.deleteMany({ where: { orderId: { in: staleOrders.map((order) => order.id) } } });
@@ -59,8 +60,20 @@ test('database-backed multi-vendor, variant, rollback, and retry inventory behav
     prisma.productPrice.create({ data: { variantId: variantA.id, price: 11, validFrom: new Date(Date.now() + 1) } }),
     prisma.productPrice.create({ data: { variantId: variantB.id, price: 12, validFrom: new Date(Date.now() + 2) } }),
   ]));
-  const keys = ['phase3-multi-vendor', 'phase3-variant', 'phase3-variant-fail', 'phase3-rollback'];
+  const keys: [string, string, string, string, string, string, string, string] = ['phase3-multi-vendor', 'phase3-variant', 'phase3-variant-fail', 'phase3-rollback', 'phase3-vendor-create', 'phase3-payment-cash', 'phase3-payment-upi', 'phase3-payment-overcollect'];
   try {
+    const createdProduct = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/vendors/${vendorA.id}/products`, vendorAUser.id, ['VENDOR'], [], { categoryId: category.id, unitId: unit.id, name: 'Phase 3 vendor-created fixture', sku: 'PHASE3-VENDOR-CREATE', price: 14 }));
+    assert.equal(createdProduct.statusCode, 201, JSON.stringify(createdProduct.payload));
+    const vendorProduct = await prisma.product.update({ where: { id: createdProduct.payload.id }, data: { stockQuantity: 5 } });
+    products.push(vendorProduct);
+    prices.push(await prisma.productPrice.findFirstOrThrow({ where: { productId: vendorProduct.id, shopId: null } }));
+    const vendorProductList = await invoke(authenticatedRequest('GET', `/api/v1/marketplace/vendors/${vendorA.id}/products`, vendorAUser.id, ['VENDOR'], [], {}));
+    assert.equal(vendorProductList.statusCode, 200);
+    assert.equal(Number(vendorProductList.payload.find((product: { id: string }) => product.id === vendorProduct.id).prices[0].price), 14);
+    const vendorProductOrder = await checkout(keys[4], customer.id, address.id, [{ productId: vendorProduct.id, quantity: 2 }]);
+    assert.equal(vendorProductOrder.statusCode, 201, JSON.stringify(vendorProductOrder.payload));
+    assert.equal(Number(vendorProductOrder.payload.subOrders[0].items[0].unitPrice), 14);
+
     const multi = await checkout(keys[0], customer.id, address.id, [{ productId: productA.id, quantity: 3 }, { productId: productB.id, quantity: 4 }]);
     assert.equal(multi.statusCode, 201, JSON.stringify(multi.payload));
     assert.equal(multi.payload.subOrders.length, 2);
@@ -75,14 +88,6 @@ test('database-backed multi-vendor, variant, rollback, and retry inventory behav
     assert.equal(await prisma.stockMovement.count({ where: { referenceId: { in: multi.payload.subOrders.map((order: { id: string }) => order.id) }, movementType: 'ORDER_DEDUCTION' } }), 2);
     const vendorAOrder = multi.payload.subOrders.find((order: { vendorId: string }) => order.vendorId === vendorA.id);
     assert.ok(vendorAOrder);
-    const cash = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/collect-payment`, admin.id, ['SUPER_ADMIN'], [], { method: 'CASH', amount: 10 }));
-    assert.equal(cash.statusCode, 201);
-    const upi = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/collect-payment`, admin.id, ['SUPER_ADMIN'], [], { method: 'UPI', amount: 20, referenceNumber: 'PHASE3-UPI-1' }));
-    assert.equal(upi.statusCode, 201);
-    assert.equal(Number(upi.payload.summary.outstanding), 0);
-    const overCollect = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/collect-payment`, admin.id, ['SUPER_ADMIN'], [], { method: 'CASH', amount: 1 }));
-    assert.equal(overCollect.statusCode, 400);
-    assert.equal(await prisma.payment.count({ where: { orderId: vendorAOrder.id } }), 2);
     const crossVendorOrder = await invoke(authenticatedRequest('GET', `/api/v1/marketplace/orders/${vendorAOrder.id}`, vendorBUser.id, ['VENDOR'], [], {}));
     assert.equal(crossVendorOrder.statusCode, 403);
     for (const status of ['CONFIRMED', 'PICKING', 'PACKED']) {
@@ -92,9 +97,34 @@ test('database-backed multi-vendor, variant, rollback, and retry inventory behav
     const assigned = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/assignment`, admin.id, ['SUPER_ADMIN'], [], { userId: deliveryUser.id }));
     assert.equal(assigned.statusCode, 201);
     assert.equal((await invoke(authenticatedRequest('GET', `/api/v1/marketplace/delivery/orders/${vendorAOrder.id}`, vendorBUser.id, ['VENDOR'], [], {}))).statusCode, 403);
+    const assignedOrders = await invoke(authenticatedRequest('GET', '/api/v1/marketplace/delivery/orders', deliveryUser.id, ['DELIVERY_PARTNER'], [], {}));
+    assert.equal(assignedOrders.statusCode, 200);
+    assert.ok(assignedOrders.payload.some((delivery: { orderId: string }) => delivery.orderId === vendorAOrder.id));
     assert.equal((await invoke(authenticatedRequest('POST', `/api/v1/marketplace/delivery/orders/${vendorAOrder.id}/accept`, deliveryUser.id, ['DELIVERY_PARTNER'], [], {}))).statusCode, 200);
     assert.equal((await invoke(authenticatedRequest('POST', `/api/v1/marketplace/delivery/orders/${vendorAOrder.id}/start`, deliveryUser.id, ['DELIVERY_PARTNER'], [], {}))).statusCode, 200);
+    const cash = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/collect-payment`, deliveryUser.id, ['DELIVERY_PARTNER'], [], { method: 'CASH', amount: 10 }, keys[5]));
+    assert.equal(cash.statusCode, 201);
+    const upi = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/collect-payment`, deliveryUser.id, ['DELIVERY_PARTNER'], [], { method: 'UPI', amount: 20, referenceNumber: 'PHASE3-UPI-1' }, keys[6]));
+    assert.equal(upi.statusCode, 201);
+    assert.equal(Number(upi.payload.summary.outstanding), 0);
+    const overCollect = await invoke(authenticatedRequest('POST', `/api/v1/marketplace/orders/${vendorAOrder.id}/collect-payment`, deliveryUser.id, ['DELIVERY_PARTNER'], [], { method: 'CASH', amount: 1 }, keys[7]));
+    assert.equal(overCollect.statusCode, 400);
+    const collectionRecords = await prisma.payment.findMany({ where: { orderId: vendorAOrder.id } });
+    assert.equal(collectionRecords.length, 2);
+    const cashPayment = collectionRecords.find((payment) => payment.method === 'CASH');
+    const upiPayment = collectionRecords.find((payment) => payment.method === 'UPI');
+    assert.ok(cashPayment);
+    assert.ok(upiPayment);
+    assert.deepEqual([cashPayment.status, Number(cashPayment.amount), cashPayment.receivedByUserId, cashPayment.deliveryPartnerId], ['CASH_COLLECTED', 10, deliveryUser.id, deliveryUser.id]);
+    assert.deepEqual([upiPayment.status, Number(upiPayment.amount), upiPayment.receivedByUserId, upiPayment.deliveryPartnerId, upiPayment.referenceNumber], ['UPI_COLLECTED', 20, deliveryUser.id, deliveryUser.id, 'PHASE3-UPI-1']);
+    const vendorOrdersDuringDelivery = await invoke(authenticatedRequest('GET', `/api/v1/marketplace/vendors/${vendorA.id}/orders`, vendorAUser.id, ['VENDOR'], [], {}));
+    assert.equal(vendorOrdersDuringDelivery.statusCode, 200);
+    assert.equal(vendorOrdersDuringDelivery.payload.find((order: { id: string }) => order.id === vendorAOrder.id).status, 'OUT_FOR_DELIVERY');
     assert.equal((await invoke(authenticatedRequest('POST', `/api/v1/marketplace/delivery/orders/${vendorAOrder.id}/complete`, deliveryUser.id, ['DELIVERY_PARTNER'], [], { payment: 'NOT_RECEIVED' }))).statusCode, 200);
+    const vendorOrdersAfterDelivery = await invoke(authenticatedRequest('GET', `/api/v1/marketplace/vendors/${vendorA.id}/orders`, vendorAUser.id, ['VENDOR'], [], {}));
+    const completedVendorOrder = vendorOrdersAfterDelivery.payload.find((order: { id: string }) => order.id === vendorAOrder.id);
+    assert.equal(completedVendorOrder.status, 'DELIVERED');
+    assert.deepEqual(new Set(completedVendorOrder.payments.map((payment: { status: string }) => payment.status)), new Set(['CASH_COLLECTED', 'UPI_COLLECTED']));
     assert.equal(await prisma.stockMovement.count({ where: { productId: productA.id, movementType: 'ORDER_DEDUCTION' } }), 1);
 
     const variant = await checkout(keys[1], customer.id, address.id, [{ productId: variantProduct.id, variantId: variantA.id, quantity: 2 }]);

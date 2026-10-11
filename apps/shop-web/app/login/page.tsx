@@ -2,9 +2,12 @@
 
 import { FormEvent, useState } from "react"
 import { useRouter } from "next/navigation"
+import { languageAfterLogin, notifyLanguageSessionAuthenticated } from "@farmmitra/shared-utils/src/language-session"
+import { useLanguage } from "@farmmitra/shared-utils/src/LanguageProvider"
 
 export default function LoginPage() {
   const router = useRouter()
+  const { setLanguage } = useLanguage()
   const [identifier, setIdentifier] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState("")
@@ -26,8 +29,12 @@ export default function LoginPage() {
       if (!roles.some((role: unknown) => ["VENDOR", "VENDOR_ADMIN", "VENDOR_STAFF"].includes(String(role)))) {
         throw new Error("A vendor account is required for this portal")
       }
+      localStorage.removeItem("farmmitra_access_token")
       localStorage.setItem("farmmitra_shop_token", data.accessToken)
       localStorage.setItem("farmmitra_shop_user", JSON.stringify(data.user))
+      const preferredLanguage = languageAfterLogin(data.user?.preferredLanguage)
+      if (preferredLanguage) setLanguage(preferredLanguage)
+      notifyLanguageSessionAuthenticated()
       router.replace("/vendor/dashboard")
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unable to sign in")

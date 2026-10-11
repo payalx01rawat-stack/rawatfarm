@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { config } from '@farmmitra/config';
 import { HttpError } from './auth.js';
 
 export type HttpRequest = IncomingMessage & { body?: unknown };
@@ -25,9 +26,24 @@ export const allowedOrigins = getAllowedOrigins();
 
 export const isAllowedOrigin = (origin: string | undefined): boolean => Boolean(origin && allowedOrigins.has(origin));
 
-export const readJson = async (request: IncomingMessage): Promise<unknown> => {
+export const setSecurityHeaders = (response: ServerResponse): void => {
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('X-Frame-Options', 'DENY');
+  response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+};
+
+export const readJson = async (request: IncomingMessage, maxBytes = config.MAX_REQUEST_BODY_BYTES): Promise<unknown> => {
+  const contentLength = Number(request.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new HttpError(413, 'Request body too large');
+
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  let size = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.from(chunk);
+    size += buffer.byteLength;
+    if (size > maxBytes) throw new HttpError(413, 'Request body too large');
+    chunks.push(buffer);
+  }
   if (chunks.length === 0) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -37,6 +53,11 @@ export const readJson = async (request: IncomingMessage): Promise<unknown> => {
 };
 
 export const sendJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
+  response.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(payload, (key, value: unknown) => key === 'upiAccountLast4' ? undefined : value));
+};
+
+export const sendSensitiveJson = (response: ServerResponse, statusCode: number, payload: unknown): void => {
   response.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
   response.end(JSON.stringify(payload));
 };
@@ -52,7 +73,6 @@ export const sendError = (response: ServerResponse, error: unknown): void => {
 };
 
 export const pathParts = (url: string | undefined): string[] => (url ?? '/').split('?')[0]!.split('/').filter(Boolean);
-
 
 
 

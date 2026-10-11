@@ -17,6 +17,7 @@ async function main(): Promise<void> {
     'SUPER_ADMIN',
     'ADMIN',
     'MANAGER',
+    'CHILD_ADMIN',
     'PACKING_STAFF',
     'DELIVERY_STAFF',
     'SHOP_OWNER',
@@ -185,6 +186,23 @@ async function main(): Promise<void> {
       'orders.reorder',
     ],
 
+    CHILD_ADMIN: [
+      'users.read',
+      'shops.read',
+      'warehouse.read',
+      'inventory.read',
+      'catalog.categories.read',
+      'catalog.units.read',
+      'catalog.products.read',
+      'catalog.products.create',
+      'catalog.products.update',
+      'catalog.variants.read',
+      'catalog.prices.read',
+      'catalog.prices.create',
+      'catalog.prices.update',
+      'orders.read',
+    ],
+
     PACKING_STAFF: [
       'farmers.read',
       'farmers.create',
@@ -267,6 +285,11 @@ async function main(): Promise<void> {
       });
 
       permissions.set(name, permission.id);
+    }
+
+    const childAdminRoleId = roles.get('CHILD_ADMIN');
+    if (childAdminRoleId) {
+      await transaction.rolePermission.deleteMany({ where: { roleId: childAdminRoleId } });
     }
 
     for (const [roleName, rolePermissionNames] of Object.entries(rolePermissions)) {

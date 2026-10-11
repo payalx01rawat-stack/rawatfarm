@@ -3,11 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { Prisma, type PrismaClient } from '@farmmitra/database';
 import { authenticate, hashPassword, HttpError, isDeliveryRole, isVendorRole, requirePermission, signAccessToken, verifyPassword } from './auth.js';
 import { audit } from './audit.js';
-import { pathParts, readJson, sendJson } from './http.js';
-import { addressSchema, adminVendorCreateSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, registerSchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, vendorStatusSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema, stockAdjustmentSchema } from './schemas.js';
+import { pathParts, readJson, sendJson, sendSensitiveJson } from './http.js';
+import { addressSchema, adminProductCreateSchema, adminProductUpdateSchema, adminVendorCreateSchema, adminMarketplaceBasePriceSchema, adminCustomerPriceSchema, automaticCustomerPricingRuleSchema, assignmentSchema, categorySchema, contactSchema, creditSchema, farmerCreateSchema, farmerUpdateSchema, inventoryAdjustmentSchema, inventoryIssueSchema, inventoryReceiptSchema, inventoryTransferSchema, loginSchema, parse, priceSchema, productSchema, productUpdateSchema, quantitySchema, shopSchema, shopUserSchema, unitSchema, userCreateSchema, userUpdateSchema, variantSchema, warehouseSchema, roleSchema, vendorSchema, vendorSettingsSchema, vendorStatusSchema, marketplaceOrderSchema, paymentCollectionSchema, customerAddressSchema, deliveryCompletionSchema, deliveryPartnerSchema, deliveryPartnerUpdateSchema, stockAdjustmentSchema, vendorProductCreateSchema, languagePreferenceSchema, cashHandoverSchema, upiIdSchema, childAdminPermissionsSchema } from './schemas.js';
 import { DEFAULT_ORDER_CUTOFF, DEFAULT_ORDER_TIMEZONE, ORDER_STATUSES, calculateDeliveryDate, deriveDeliveryStatus, hashRequestPayload, isValidStatusTransition, orderSchema, parseRequestedDeliveryDate, quantityValidationError, type QuantityChange } from './orders.js';
 import { calculateAvailableQuantity, isReservationActionAllowed, parseDecimalQuantity, stockStatus } from './inventory.js';
 import { buildPaymentSummary } from './payment-summary.js';
+import { buildCustomerLedger } from './customer-ledger.js';
 
 const body = async <T>(request: IncomingMessage, schema: { parse(value: unknown): T }): Promise<T> => {
   try {
@@ -24,7 +25,7 @@ const idFrom = (parts: string[], index: number): string => {
   return value;
 };
 
-const publicUser = (user: { id: string; name: string; email: string | null; mobile: string | null; preferredLanguage: string; status: string; roles?: { role: { name: string } }[] }) => ({
+const publicUser = (user: { id: string; name: string; email: string | null; mobile: string | null; preferredLanguage: string; status: string; roles?: { role: { name: string } }[]; childAdminPermissions?: { permission: { name: string } }[] }) => ({
   id: user.id,
   name: user.name,
   email: user.email,
@@ -32,6 +33,7 @@ const publicUser = (user: { id: string; name: string; email: string | null; mobi
   preferredLanguage: user.preferredLanguage,
   status: user.status,
   roles: user.roles?.map(({ role }) => role.name) ?? [],
+  childAdminPermissions: user.childAdminPermissions?.map(({ permission }) => permission.name) ?? [],
 });
 
 const authAndPermission = async (request: IncomingMessage, database: PrismaClient, permission: string) => {
@@ -40,7 +42,104 @@ const authAndPermission = async (request: IncomingMessage, database: PrismaClien
   return context;
 };
 
-const isAdminLike = (roles: string[]): boolean => roles.some((role) => ['SUPER_ADMIN', 'ADMIN', 'MANAGER'].includes(role));
+const CHILD_ADMIN_READ_PERMISSIONS = [
+  'users.read',
+  'shops.read',
+  'warehouse.read',
+  'inventory.read',
+  'catalog.categories.read',
+  'catalog.units.read',
+  'catalog.products.read',
+  'catalog.products.create',
+  'catalog.products.update',
+  'catalog.variants.read',
+  'catalog.prices.read',
+  'catalog.prices.create',
+  'catalog.prices.update',
+  'orders.read',
+];
+
+const provisionChildAdminRole = async (database: PrismaClient) => database.$transaction(async (transaction) => {
+  const role = await transaction.role.upsert({
+    where: { name: 'CHILD_ADMIN' },
+    update: {},
+    create: { name: 'CHILD_ADMIN', description: 'Read-only business access' },
+  });
+  const permissions = await transaction.permission.findMany({ where: { name: { in: CHILD_ADMIN_READ_PERMISSIONS } } });
+  if (permissions.length !== CHILD_ADMIN_READ_PERMISSIONS.length) throw new HttpError(500, 'Child Admin read permissions are not configured');
+  await transaction.rolePermission.deleteMany({ where: { roleId: role.id } });
+  await transaction.rolePermission.createMany({
+    data: permissions.map((permission) => ({ roleId: role.id, permissionId: permission.id })),
+    skipDuplicates: true,
+  });
+  return role;
+});
+
+const isAdminLike = (roles: string[]): boolean => roles.some((role) => ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'CHILD_ADMIN'].includes(role));
+const childAdminPermissionForRoute = (method: string, parts: string[]): string | undefined => {
+  if (method === 'POST' && parts[2] === 'catalog' && parts[3] === 'products' && parts.length === 4) return 'catalog.products.create';
+  if ((method === 'PATCH' || method === 'DELETE') && parts[2] === 'catalog' && parts[3] === 'products' && parts.length === 5) return 'catalog.products.update';
+  if (parts[2] === 'marketplace' && parts[3] === 'admin' && parts[4] === 'pricing') {
+    if (method === 'GET' && parts.length === 5) return 'catalog.prices.read';
+    if (method === 'PATCH' && parts.length === 5) return 'catalog.prices.update';
+    if (method === 'POST' && parts[5] === 'overrides' && parts.length === 6) return 'catalog.prices.create';
+    if (method === 'DELETE' && parts[5] === 'overrides' && parts.length === 7) return 'catalog.prices.update';
+  }
+  if (method !== 'GET') return undefined;
+  const route = parts.slice(2);
+  if (route[0] === 'users' && route.length === 1) return 'users.read';
+  if (route[0] === 'orders' && (route.length === 1 || route.length === 2)) return 'orders.read';
+  if (route[0] === 'shops' && (route.length === 1 || route.length === 2)) return 'shops.read';
+  if (route[0] === 'catalog' && route.length === 2) {
+    if (route[1] === 'categories') return 'catalog.categories.read';
+    if (route[1] === 'units') return 'catalog.units.read';
+    if (route[1] === 'products') return 'catalog.products.read';
+  }
+  if (route[0] === 'marketplace' && route[1] === 'admin') {
+    if (route.length === 3 && route[2] === 'vendors') return 'shops.read';
+    if (route.length === 4 && route[2] === 'vendors') return 'shops.read';
+    if (route.length === 3 && route[2] === 'customer-prices') return 'catalog.prices.read';
+  }
+  return undefined;
+};
+const hasChildAdminRoutePermission = (permissions: string[], required: string, method: string, parts: string[]): boolean => (
+  permissions.includes(required)
+  || (method === 'GET' && parts[2] === 'users' && parts.length === 3 && required === 'users.read' && permissions.includes('catalog.prices.read'))
+);
+const requireCustomer = (context: Awaited<ReturnType<typeof authenticate>>): void => {
+  if (!context.roles.includes('CUSTOMER')) throw new HttpError(403, 'An active enrolled customer account is required');
+};
+
+const findMarketplacePrice = async (database: PrismaClient, input: { customerId?: string; vendorId: string; productId: string; variantId?: string }) => {
+  if (input.customerId && !input.variantId) {
+    const override = await database.customerProductPrice.findFirst({
+      where: { customerId: input.customerId, vendorId: input.vendorId, productId: input.productId, isActive: true },
+      select: { price: true },
+    });
+    if (override) return { price: override.price, source: 'CUSTOMER_OVERRIDE' as const };
+  }
+  const price = await database.productPrice.findFirst({
+    where: {
+      ...(input.variantId ? { variantId: input.variantId } : { productId: input.productId }),
+      shopId: null,
+      validTo: null,
+      validFrom: { lte: new Date() },
+    },
+    orderBy: { validFrom: 'desc' },
+    select: { price: true },
+  });
+  if (price && input.customerId) {
+    const rule = await database.vendorCustomerPricingRule.findUnique({ where: { vendorId: input.vendorId } });
+    if (rule?.isActive) {
+      const customer = await database.user.findUnique({ where: { id: input.customerId }, select: { createdAt: true } });
+      if (customer && customer.createdAt >= rule.effectiveFrom) {
+        const adjustedPrice = Math.max(0, Math.round(Number(price.price) * (1 + Number(rule.percentAdjustment) / 100) * 100) / 100);
+        return { price: adjustedPrice, source: 'AUTOMATIC_RULE' as const };
+      }
+    }
+  }
+  return price ? { price: price.price, source: 'BASE' as const } : null;
+};
 
 const isVendorOperational = (vendor: { status?: string; isActive?: boolean }): boolean => vendor.status === 'APPROVED' && vendor.isActive !== false;
 
@@ -75,6 +174,22 @@ const ensureAssignedDelivery = async (database: PrismaClient, orderId: string, u
   const delivery = await database.delivery.findFirst({ where: { orderId, assignments: { some: { userId } } }, include: { order: { include: { vendor: true, items: true, payments: true } }, assignments: true } });
   if (!delivery) throw new HttpError(403, 'This delivery is not assigned to you');
   return delivery;
+};
+
+const requirePaymentCollectionCapability = async (database: PrismaClient, userId: string, vendorId: string, isSuperAdmin: boolean): Promise<void> => {
+  if (isSuperAdmin) return;
+  const access = await database.vendorUser.findUnique({ where: { userId_vendorId: { userId, vendorId } } });
+  const capabilities = Array.isArray(access?.capabilities) ? access.capabilities : [];
+  if (!access?.isActive || !capabilities.includes('PAYMENT_COLLECTION')) throw new HttpError(403, 'Payment collection capability is required');
+};
+
+const assertPaymentMethodEnabled = (vendor: { cashCollectionEnabled?: boolean; upiCollectionEnabled?: boolean; upiId?: string | null }, method: string): void => {
+  if (method === 'CASH' && vendor.cashCollectionEnabled === false) throw new HttpError(400, 'Cash collection is disabled for this vendor');
+  if (method === 'UPI' && (!vendor.upiCollectionEnabled || !upiIdSchema.safeParse(vendor.upiId).success)) throw new HttpError(400, 'Vendor UPI collection is not configured');
+};
+
+const lockOrderForPayment = async (tx: Prisma.TransactionClient, orderId: string): Promise<void> => {
+  await tx.$queryRaw`SELECT id FROM \`Order\` WHERE id = ${orderId} FOR UPDATE`;
 };
 
 const getIdempotencyKey = (request: IncomingMessage): string | undefined => {
@@ -136,24 +251,31 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
   const parts = pathParts(request.url);
   if (parts[0] !== 'api' || parts[1] !== 'v1') return false;
   const method = request.method ?? 'GET';
+  if (request.headers.authorization?.startsWith('Bearer ') && request.headers.authorization.length > 7) {
+    const context = await authenticate(request, database);
+    if (context.roles.includes('CHILD_ADMIN')) {
+      const requiredPermission = childAdminPermissionForRoute(method, parts);
+      if (context.roles.length !== 1 || !requiredPermission || !hasChildAdminRoutePermission(context.permissions, requiredPermission, method, parts)) {
+        throw new HttpError(403, 'This resource is not assigned to your Child Admin account');
+      }
+    }
+  }
 
   if (parts[2] === 'auth') {
     if (method === 'POST' && parts[3] === 'register') {
-      const input = await body(request, registerSchema);
-      if (!input.email && !input.mobile) throw new HttpError(400, 'Email or mobile is required');
-      const existing = await database.user.findFirst({ where: { OR: [{ email: input.email ?? undefined }, { mobile: input.mobile ?? undefined }] } });
-      if (existing) throw new HttpError(409, 'A user with that email or mobile already exists');
-      const role = await database.role.upsert({ where: { name: 'CUSTOMER' }, update: {}, create: { name: 'CUSTOMER' } });
-      const user = await database.user.create({ data: { name: input.name, email: input.email, mobile: input.mobile, preferredLanguage: input.preferredLanguage, passwordHash: await hashPassword(input.password), roles: { create: [{ roleId: role.id }] } }, include: { roles: { include: { role: true } } } });
-      await audit(database, user.id, 'CREATE', 'User', user.id);
-      const token = signAccessToken({ userId: user.id, roles: ['CUSTOMER'], permissions: [] });
-      sendJson(response, 201, { user: publicUser(user), accessToken: token });
-      return true;
+      throw new HttpError(403, 'Customer enrollment is managed by an administrator');
     }
     if (method === 'POST' && parts[3] === 'login') {
       const input = await body(request, loginSchema);
-      const user = await database.user.findFirst({ where: { OR: [{ email: input.identifier }, { mobile: input.identifier }] }, include: { roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } } } });
-      if (!user || user.status !== 'ACTIVE' || !(await verifyPassword(input.password, user.passwordHash))) throw new HttpError(401, 'Invalid credentials');
+      const user = await database.user.findFirst({
+        where: { OR: [{ email: input.identifier }, { mobile: input.identifier }] },
+        include: {
+          roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } },
+          childAdminPermissions: { include: { permission: { select: { name: true } } } },
+        },
+      });
+      if (!user || !(await verifyPassword(input.password, user.passwordHash))) throw new HttpError(401, 'Invalid credentials');
+      if (user.status !== 'ACTIVE') throw new HttpError(403, 'This account is inactive. Contact an administrator.');
       const roles = user.roles.map(({ role }) => role.name);
       const permissions = user.roles.flatMap(({ role }) => role.permissions.map(({ permission }) => permission.name));
       await audit(database, user.id, 'LOGIN', 'User', user.id);
@@ -162,7 +284,13 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     }
     if (method === 'GET' && parts[3] === 'me') {
       const context = await authenticate(request, database);
-      const user = await database.user.findUnique({ where: { id: context.userId }, include: { roles: { include: { role: true } } } });
+      const user = await database.user.findUnique({
+        where: { id: context.userId },
+        include: {
+          roles: { include: { role: true } },
+          childAdminPermissions: { include: { permission: { select: { name: true } } } },
+        },
+      });
       if (!user) throw new HttpError(404, 'User not found');
       sendJson(response, 200, { user: publicUser(user), permissions: context.permissions });
       return true;
@@ -171,17 +299,45 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
   }
 
   if (parts[2] === 'users') {
+    if (method === 'PATCH' && parts[3] === 'me' && parts[4] === 'preferred-language' && parts.length === 5) {
+      const context = await authenticate(request, database);
+      const { preferredLanguage } = await body(request, languagePreferenceSchema);
+      const user = await database.user.update({
+        where: { id: context.userId },
+        data: { preferredLanguage },
+        include: { roles: { include: { role: true } } },
+      });
+      sendJson(response, 200, publicUser(user));
+      return true;
+    }
     if (method === 'GET' && parts.length === 3) {
-      await authAndPermission(request, database, 'users.read');
-      const users = await database.user.findMany({ orderBy: { createdAt: 'desc' }, include: { roles: { include: { role: true } } } });
+      const context = await authenticate(request, database);
+      if (!(context.roles.length === 1 && context.roles.includes('CHILD_ADMIN') && context.permissions.includes('catalog.prices.read'))) {
+        requirePermission(context, 'users.read');
+      }
+      const users = await database.user.findMany({
+        ...(context.roles.includes('CHILD_ADMIN') ? { where: { roles: { some: { role: { name: 'CUSTOMER' } } } } } : {}),
+        orderBy: { createdAt: 'desc' },
+        include: {
+          roles: { include: { role: true } },
+          childAdminPermissions: { include: { permission: { select: { name: true } } } },
+        },
+      });
       sendJson(response, 200, users.map(publicUser));
       return true;
     }
     if (method === 'POST' && parts.length === 3) {
       const context = await authAndPermission(request, database, 'users.create');
       const input = await body(request, userCreateSchema);
+      if (input.roleNames.includes('CHILD_ADMIN') && (!context.roles.includes('SUPER_ADMIN') || input.roleNames.length !== 1)) {
+        throw new HttpError(403, 'Only a super admin can create a dedicated Child Admin account');
+      }
       if (input.roleNames.includes('SUPER_ADMIN') && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Only a super admin can assign SUPER_ADMIN');
-      const roles = await database.role.findMany({ where: { name: { in: input.roleNames } } });
+      let roles = await database.role.findMany({ where: { name: { in: input.roleNames } } });
+      if (input.roleNames.includes('CHILD_ADMIN')) {
+        const childAdminRole = await provisionChildAdminRole(database);
+        roles = [...roles.filter((role) => role.name !== 'CHILD_ADMIN'), childAdminRole];
+      }
       if (roles.length !== input.roleNames.length) throw new HttpError(400, 'One or more roles do not exist');
       const user = await database.user.create({ data: { name: input.name, email: input.email, mobile: input.mobile, preferredLanguage: input.preferredLanguage, passwordHash: await hashPassword(input.password), roles: { create: roles.map((role) => ({ roleId: role.id })) } }, include: { roles: { include: { role: true } } } });
       await audit(database, context.userId, 'CREATE', 'User', user.id);
@@ -191,6 +347,130 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     if (parts.length >= 4) {
       const userId = idFrom(parts, 3);
       const context = await authenticate(request, database);
+      if (method === 'PUT' && parts[4] === 'child-admin-permissions' && parts.length === 5) {
+        if (!context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Only a super admin can assign Child Admin permissions');
+        const { permissionNames } = await body(request, childAdminPermissionsSchema);
+        const target = await database.user.findUnique({
+          where: { id: userId },
+          include: { roles: { include: { role: true } } },
+        });
+        if (!target?.roles.some(({ role }) => role.name === 'CHILD_ADMIN')
+          || target.roles.some(({ role }) => role.name !== 'CHILD_ADMIN')) {
+          throw new HttpError(404, 'Dedicated Child Admin account not found');
+        }
+        const assignedPermissions = await database.$transaction(async (transaction) => {
+          const permissions = await transaction.permission.findMany({ where: { name: { in: permissionNames } } });
+          if (permissions.length !== new Set(permissionNames).size) {
+            throw new HttpError(500, 'One or more Child Admin permissions are not configured');
+          }
+          await transaction.childAdminPermission.deleteMany({ where: { userId } });
+          if (permissions.length > 0) {
+            await transaction.childAdminPermission.createMany({
+              data: permissions.map((permission) => ({ userId, permissionId: permission.id })),
+              skipDuplicates: true,
+            });
+          }
+          return permissions.map((permission) => permission.name).sort();
+        });
+        await audit(database, context.userId, 'UPDATE', 'ChildAdminPermission', userId, { permissionNames: assignedPermissions });
+        sendJson(response, 200, { userId, permissionNames: assignedPermissions });
+        return true;
+      }
+      if (method === 'GET' && parts[4] === 'financial-history' && parts.length === 5) {
+        const ownCustomerHistory = userId === 'me';
+        if (ownCustomerHistory) {
+          if (!context.roles.includes('CUSTOMER')) throw new HttpError(403, 'Customer access is required');
+        } else {
+          requirePermission(context, 'users.read');
+        }
+        const customerId = ownCustomerHistory ? context.userId : userId;
+        const customer = await database.user.findUnique({
+          where: { id: customerId },
+          include: {
+            roles: { include: { role: true } },
+            customerAddresses: { orderBy: { createdAt: 'desc' } },
+          },
+        });
+        if (!customer || !customer.roles.some(({ role }) => role.name === 'CUSTOMER')) throw new HttpError(404, 'Customer not found');
+
+        const orders = await database.order.findMany({
+          where: {
+            vendor: { is: { name: 'Rawat Farm' } },
+            OR: [{ customerId }, { masterOrder: { is: { customerId } } }],
+          },
+          include: {
+            items: true,
+            payments: { include: { receivedBy: true, deliveryPartner: true }, orderBy: { receivedAt: 'desc' } },
+            deliveries: { include: { assignments: { include: { user: true } } }, orderBy: { createdAt: 'desc' } },
+          },
+          orderBy: [{ orderDate: 'desc' }, { createdAt: 'desc' }],
+        });
+        const isCollected = (status: string): boolean => ['COMPLETED', 'CASH_COLLECTED', 'UPI_COLLECTED'].includes(status);
+        const payments = orders.flatMap((order) => order.payments.map((payment) => ({
+          id: payment.id,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+          amount: payment.amount,
+          method: payment.method,
+          status: payment.status,
+          referenceNumber: payment.referenceNumber,
+          paymentDate: payment.receivedAt ?? payment.paidAt,
+          receivedBy: payment.deliveryPartner?.name ?? payment.receivedBy?.name ?? null,
+        }))).sort((left, right) => new Date(right.paymentDate ?? 0).getTime() - new Date(left.paymentDate ?? 0).getTime());
+        const totalOrderValue = orders.reduce((sum, order) => sum + Number(order.totalAmount), 0);
+        const totalPaid = payments.filter((payment) => isCollected(payment.status)).reduce((sum, payment) => sum + Number(payment.amount), 0);
+        const query = new URL(request.url ?? '/', 'http://localhost').searchParams;
+        const parseDate = (value: string | null, endOfDay: boolean): Date | undefined => {
+          if (!value) return undefined;
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new HttpError(400, 'Date filters must use YYYY-MM-DD');
+          const validDate = new Date(`${value}T00:00:00.000Z`);
+          if (Number.isNaN(validDate.getTime()) || validDate.toISOString().slice(0, 10) !== value) throw new HttpError(400, 'Date filter is invalid');
+          const parsed = new Date(`${value}T00:00:00+05:30`);
+          if (endOfDay) parsed.setTime(parsed.getTime() + 24 * 60 * 60 * 1000);
+          return parsed;
+        };
+        const from = parseDate(query.get('from'), false);
+        const toExclusive = parseDate(query.get('to'), true);
+        if (from && toExclusive && from >= toExclusive) throw new HttpError(400, 'Start date must not be after end date');
+        const requestedPage = Number(query.get('page') ?? 1);
+        const requestedPageSize = Number(query.get('pageSize') ?? 50);
+        if (!Number.isInteger(requestedPage) || requestedPage < 1 || !Number.isInteger(requestedPageSize) || requestedPageSize < 1 || requestedPageSize > 100) {
+          throw new HttpError(400, 'Pagination values are invalid');
+        }
+        const ledger = buildCustomerLedger(orders, { from, toExclusive, page: requestedPage, pageSize: requestedPageSize });
+        const orderHistory = orders.map((order) => {
+          const collectedPayments = order.payments.filter((payment) => isCollected(payment.status));
+          const paid = collectedPayments.reduce((sum, payment) => sum + Number(payment.amount), 0);
+          return {
+            ...order,
+            paymentCollected: paid,
+            outstanding: Math.max(0, Number(order.totalAmount) - paid),
+            paymentMethods: Array.from(new Set(order.payments.map((payment) => payment.method))),
+            deliveryStatus: order.deliveries[0]?.status ?? null,
+          };
+        });
+        sendJson(response, 200, {
+          customer: {
+            id: customer.id,
+            name: customer.name,
+            email: customer.email,
+            mobile: customer.mobile,
+            mobile2: null,
+            status: customer.status,
+            addresses: customer.customerAddresses,
+          },
+          summary: {
+            totalOrders: orders.length,
+            totalOrderValue,
+            totalPaid,
+            outstanding: Math.max(0, totalOrderValue - totalPaid),
+          },
+          ledger,
+          payments,
+          orders: orderHistory,
+        });
+        return true;
+      }
       if (method === 'GET' && parts.length === 4) {
         requirePermission(context, 'users.read');
         const user = await database.user.findUnique({ where: { id: userId }, include: { roles: { include: { role: true } } } });
@@ -200,6 +480,11 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       }
       if (method === 'PATCH' && parts.length === 4) {
         requirePermission(context, 'users.update');
+        const target = await database.user.findUnique({ where: { id: userId }, include: { roles: { include: { role: true } } } });
+        if (!target) throw new HttpError(404, 'User not found');
+        if (target.roles.some(({ role }) => role.name === 'CHILD_ADMIN') && !context.roles.includes('SUPER_ADMIN')) {
+          throw new HttpError(403, 'Only a super admin can manage a Child Admin account');
+        }
         const input = await body(request, userUpdateSchema);
         const data = { ...input, passwordHash: input.password ? await hashPassword(input.password) : undefined };
         delete (data as { password?: string }).password;
@@ -211,8 +496,17 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       if (method === 'POST' && parts[4] === 'roles') {
         requirePermission(context, 'users.roles.assign');
         const input = await body(request, roleSchema);
+        const target = await database.user.findUnique({ where: { id: userId }, include: { roles: { include: { role: true } } } });
+        if (!target) throw new HttpError(404, 'User not found');
+        const targetIsChildAdmin = target.roles.some(({ role }) => role.name === 'CHILD_ADMIN');
+        if ((input.roleName === 'CHILD_ADMIN' && (!context.roles.includes('SUPER_ADMIN') || target.roles.length > 0 || target.status !== 'ACTIVE'))
+          || (targetIsChildAdmin && input.roleName !== 'CHILD_ADMIN')) {
+          throw new HttpError(403, 'Child Admin role assignments require a dedicated active account and super admin access');
+        }
         if (input.roleName === 'SUPER_ADMIN' && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Only a super admin can assign SUPER_ADMIN');
-        const role = await database.role.findUnique({ where: { name: input.roleName } });
+        const role = input.roleName === 'CHILD_ADMIN'
+          ? await provisionChildAdminRole(database)
+          : await database.role.findUnique({ where: { name: input.roleName } });
         if (!role) throw new HttpError(404, 'Role not found');
         await database.userRole.upsert({ where: { userId_roleId: { userId, roleId: role.id } }, update: {}, create: { userId, roleId: role.id } });
         await audit(database, context.userId, 'ASSIGN_ROLE', 'User', userId, { role: input.roleName });
@@ -222,9 +516,24 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       if (method === 'DELETE' && parts[4] === 'roles') {
         requirePermission(context, 'users.roles.assign');
         const input = await body(request, roleSchema);
+        const target = await database.user.findUnique({ where: { id: userId }, include: { roles: { include: { role: true } } } });
+        if (!target) throw new HttpError(404, 'User not found');
+        if (input.roleName === 'CHILD_ADMIN' && (!context.roles.includes('SUPER_ADMIN') || !target.roles.some(({ role }) => role.name === 'CHILD_ADMIN'))) {
+          throw new HttpError(403, 'Only a super admin can revoke an assigned Child Admin role');
+        }
         const role = await database.role.findUnique({ where: { name: input.roleName } });
         if (!role) throw new HttpError(404, 'Role not found');
-        await database.userRole.delete({ where: { userId_roleId: { userId, roleId: role.id } } });
+        if (input.roleName === 'CHILD_ADMIN') {
+          await database.$transaction(async (transaction) => {
+            await transaction.userRole.delete({ where: { userId_roleId: { userId, roleId: role.id } } });
+            await transaction.user.update({ where: { id: userId }, data: { status: 'INACTIVE' } });
+          });
+        } else {
+          if (target.roles.some(({ role: targetRole }) => targetRole.name === 'CHILD_ADMIN')) {
+            throw new HttpError(403, 'Remove the Child Admin role before changing account roles');
+          }
+          await database.userRole.delete({ where: { userId_roleId: { userId, roleId: role.id } } });
+        }
         await audit(database, context.userId, 'REMOVE_ROLE', 'User', userId, { role: input.roleName });
         sendJson(response, 204, null);
         return true;
@@ -472,6 +781,34 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
   }
 
   if (parts[2] === 'marketplace') {
+    if (method === 'GET' && parts[3] === 'delivery' && parts[4] === 'collectible-orders' && parts.length === 5) {
+      const context = await authenticate(request, database);
+      if (!isDeliveryRole(context.roles) && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Delivery partner access is required');
+      const vendors = await database.vendor.findMany({
+        where: { name: 'Rawat Farm', isActive: true, status: 'APPROVED' },
+        select: { id: true },
+      });
+      if (vendors.length !== 1) throw new HttpError(409, 'Exactly one active approved Rawat Farm vendor is required');
+      const vendorId = vendors[0]!.id;
+      await requirePaymentCollectionCapability(database, context.userId, vendorId, context.roles.includes('SUPER_ADMIN'));
+      const orders = await database.order.findMany({
+        where: { vendorId, status: { not: 'CANCELLED' } },
+        include: {
+          vendor: true,
+          items: true,
+          payments: { include: { receivedBy: true, deliveryPartner: true } },
+          deliveries: { include: { assignments: { include: { user: true } } } },
+        },
+        orderBy: [{ orderDate: 'desc' }, { createdAt: 'desc' }],
+      });
+      const collectible = orders.map((order) => ({
+        ...order,
+        paymentSummary: buildPaymentSummary(order.totalAmount, order.payments, order.orderDate),
+      })).filter((order) => order.paymentSummary.outstanding > 0);
+      sendJson(response, 200, collectible);
+      return true;
+    }
+
     if (method === 'GET' && parts[3] === 'me' && parts.length === 4) {
       const context = await authenticate(request, database);
       const access = await database.vendorUser.findFirst({ where: { userId: context.userId, isActive: true }, include: { vendor: { include: { products: { where: { status: 'ACTIVE' }, select: { id: true } }, users: { select: { isActive: true, capabilities: true } } } } } });
@@ -481,18 +818,317 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     }
 
     if (parts[3] === 'admin') {
-      const context = await authAndPermission(request, database, 'vendors.manage');
-      if (!context.roles.includes('SUPER_ADMIN') && !context.roles.includes('ADMIN')) throw new HttpError(403, 'Super admin access is required');
+      const context = await authenticate(request, database);
+      const isChildAdmin = context.roles.length === 1 && context.roles.includes('CHILD_ADMIN');
+      if (!isChildAdmin) requirePermission(context, 'vendors.manage');
+      if (!context.roles.includes('SUPER_ADMIN') && !context.roles.includes('ADMIN') && !isChildAdmin) throw new HttpError(403, 'Super admin access is required');
+      if (parts[4] === 'pricing') {
+        const query = new URL(request.url ?? '/', 'http://localhost').searchParams;
+        if (method === 'GET') {
+          const vendorId = query.get('vendorId');
+          if (query.get('action') === 'automatic') {
+            if (!vendorId) throw new HttpError(400, 'Shop is required');
+            if (isChildAdmin) requirePermission(context, 'catalog.prices.read');
+            const [vendor, rule] = await Promise.all([
+              database.vendor.findUnique({ where: { id: vendorId }, select: { id: true } }),
+              database.vendorCustomerPricingRule.findUnique({ where: { vendorId } }),
+            ]);
+            if (!vendor) throw new HttpError(404, 'Shop not found');
+            sendJson(response, 200, rule);
+            return true;
+          }
+          const customerId = query.get('customerId');
+          if (!vendorId || !customerId) throw new HttpError(400, 'Shop and customer are required');
+          if (isChildAdmin) requirePermission(context, 'catalog.prices.read');
+          const [vendor, customer] = await Promise.all([
+            database.vendor.findUnique({ where: { id: vendorId }, select: { id: true, name: true } }),
+            database.user.findUnique({ where: { id: customerId }, include: { roles: { include: { role: true } } } }),
+          ]);
+          if (!vendor) throw new HttpError(404, 'Shop not found');
+          if (!customer || !customer.roles.some(({ role }) => role.name === 'CUSTOMER')) throw new HttpError(404, 'Customer not found');
+          const automaticRule = await database.vendorCustomerPricingRule.findUnique({ where: { vendorId } });
+          const products = await database.product.findMany({
+            where: { vendorId },
+            include: {
+              unit: true,
+              prices: { where: { shopId: null, validTo: null, validFrom: { lte: new Date() } }, orderBy: { validFrom: 'desc' }, take: 1 },
+              customerPrices: { where: { customerId, vendorId, isActive: true }, take: 1 },
+            },
+            orderBy: { name: 'asc' },
+          });
+          sendJson(response, 200, products.map((product) => {
+            const basePrice = product.prices[0]?.price ?? null;
+            const customerPrice = product.customerPrices[0]?.price ?? null;
+            const automaticApplies = customerPrice == null && basePrice != null && automaticRule?.isActive
+              && customer.createdAt >= automaticRule.effectiveFrom;
+            const effectivePrice = customerPrice ?? (automaticApplies
+              ? Math.max(0, Math.round(Number(basePrice) * (1 + Number(automaticRule.percentAdjustment) / 100) * 100) / 100)
+              : basePrice);
+            return {
+              id: product.id,
+              name: product.name,
+              status: product.status,
+              vendorId: product.vendorId,
+              unit: product.unit,
+              basePrice,
+              customerPrice,
+              effectivePrice,
+              effectiveSource: customerPrice != null ? 'CUSTOMER_OVERRIDE' : automaticApplies ? 'AUTOMATIC_RULE' : 'BASE',
+              overrideId: product.customerPrices[0]?.id ?? null,
+            };
+          }));
+          return true;
+        }
+        if (method === 'PATCH' && query.get('action') === 'automatic') {
+          if (isChildAdmin) requirePermission(context, 'catalog.prices.update');
+          const input = await body(request, automaticCustomerPricingRuleSchema);
+          const vendor = await database.vendor.findUnique({ where: { id: input.vendorId }, select: { id: true } });
+          if (!vendor) throw new HttpError(404, 'Shop not found');
+          const rule = await database.vendorCustomerPricingRule.upsert({
+            where: { vendorId: input.vendorId },
+            create: { ...input, effectiveFrom: new Date() },
+            update: { percentAdjustment: input.percentAdjustment, isActive: input.isActive, effectiveFrom: new Date() },
+          });
+          await audit(database, context.userId, 'UPDATE', 'VendorCustomerPricingRule', rule.id, {
+            vendorId: rule.vendorId,
+            percentAdjustment: rule.percentAdjustment,
+            isActive: rule.isActive,
+          });
+          sendJson(response, 200, rule);
+          return true;
+        }
+        if (method === 'PATCH' && query.get('action') === 'base') {
+          if (isChildAdmin) requirePermission(context, 'catalog.prices.update');
+          const input = await body(request, adminMarketplaceBasePriceSchema);
+          const product = await database.product.findFirst({ where: { id: input.productId, vendorId: input.vendorId }, select: { id: true } });
+          if (!product) throw new HttpError(404, 'Product not found for this shop');
+          const result = await database.$transaction(async (tx) => {
+            const currentPrice = await tx.productPrice.findFirst({
+              where: { productId: product.id, shopId: null, validTo: null },
+              orderBy: { validFrom: 'desc' },
+            });
+            const validFrom = new Date();
+            if (currentPrice) await tx.productPrice.update({ where: { id: currentPrice.id }, data: { validTo: validFrom } });
+            return tx.productPrice.create({ data: { productId: product.id, shopId: null, price: input.price, validFrom } });
+          });
+          await audit(database, context.userId, 'UPDATE', 'ProductPrice', product.id, { vendorId: input.vendorId, price: input.price });
+          sendJson(response, 200, result);
+          return true;
+        }
+        if (method === 'POST' && parts[5] === 'overrides' && parts.length === 6) {
+          if (isChildAdmin) requirePermission(context, 'catalog.prices.create');
+          const input = await body(request, adminCustomerPriceSchema);
+          const [product, customer] = await Promise.all([
+            database.product.findFirst({ where: { id: input.productId, vendorId: input.vendorId }, select: { id: true } }),
+            database.user.findUnique({ where: { id: input.customerId }, include: { roles: { include: { role: true } } } }),
+          ]);
+          if (!product) throw new HttpError(404, 'Product not found for this shop');
+          if (!customer || !customer.roles.some(({ role }) => role.name === 'CUSTOMER')) throw new HttpError(404, 'Customer not found');
+          const price = await database.customerProductPrice.upsert({
+            where: { customerId_vendorId_productId: { customerId: input.customerId, vendorId: input.vendorId, productId: input.productId } },
+            create: { ...input, isActive: true },
+            update: { price: input.price, isActive: true },
+          });
+          await audit(database, context.userId, 'UPDATE', 'CustomerProductPrice', price.id, { customerId: input.customerId, vendorId: input.vendorId, productId: input.productId, price: input.price });
+          sendJson(response, 200, price);
+          return true;
+        }
+        if (method === 'DELETE' && parts[5] === 'overrides' && parts.length === 7) {
+          const overrideId = idFrom(parts, 6);
+          if (isChildAdmin) requirePermission(context, 'catalog.prices.update');
+          const override = await database.customerProductPrice.findUnique({ where: { id: overrideId } });
+          if (!override) throw new HttpError(404, 'Customer price override not found');
+          const vendorId = query.get('vendorId');
+          const customerId = query.get('customerId');
+          const productId = query.get('productId');
+          if (isChildAdmin && (
+            !vendorId || !customerId || !productId
+            || override.vendorId !== vendorId
+            || override.customerId !== customerId
+            || override.productId !== productId
+          )) {
+            throw new HttpError(404, 'Customer price override not found');
+          }
+          const removed = await database.customerProductPrice.update({ where: { id: overrideId }, data: { isActive: false } });
+          await audit(database, context.userId, 'DELETE', 'CustomerProductPrice', overrideId, { customerId: override.customerId, vendorId: override.vendorId, productId: override.productId });
+          sendJson(response, 200, { id: removed.id, isActive: removed.isActive });
+          return true;
+        }
+      }
+      if (method === 'GET' && parts[4] === 'cash-handovers' && parts.length === 5) {
+        const vendors = await database.vendor.findMany({
+          where: { name: 'Rawat Farm', isActive: true, status: 'APPROVED' },
+          select: { id: true },
+        });
+        if (vendors.length !== 1) throw new HttpError(409, 'Exactly one active approved Rawat Farm vendor is required');
+        const vendorId = vendors[0]!.id;
+        const memberships = await database.vendorUser.findMany({
+          where: { vendorId, isActive: true },
+          include: { user: { include: { roles: { include: { role: true } } } } },
+          orderBy: { assignedAt: 'asc' },
+        });
+        const partners = await Promise.all(memberships
+          .filter(({ user, capabilities }) => user.status === 'ACTIVE'
+            && (user.roles.some(({ role }) => ['DELIVERY_PARTNER', 'DELIVERY_STAFF'].includes(role.name))
+              || (Array.isArray(capabilities) && capabilities.includes('DELIVERY'))))
+          .map(async ({ user }) => {
+            const [cash, handovers] = await Promise.all([
+              database.payment.aggregate({
+                where: { vendorId, deliveryPartnerId: user.id, method: 'CASH', status: 'CASH_COLLECTED' },
+                _sum: { amount: true },
+              }),
+              database.cashHandover.aggregate({
+                where: { vendorId, deliveryPartnerId: user.id },
+                _sum: { amount: true },
+              }),
+            ]);
+            const cashCollected = Number(cash._sum.amount ?? 0);
+            const cashHandedOver = Number(handovers._sum.amount ?? 0);
+            return { id: user.id, name: user.name, cashCollected, cashHandedOver, availableCash: Math.max(0, cashCollected - cashHandedOver) };
+          }));
+        const handovers = await database.cashHandover.findMany({
+          where: { vendorId },
+          include: { deliveryPartner: { select: { id: true, name: true } }, receivedBy: { select: { id: true, name: true } } },
+          orderBy: { createdAt: 'desc' },
+          take: 100,
+        });
+        sendJson(response, 200, { partners, handovers });
+        return true;
+      }
+      if (method === 'GET' && parts[4] === 'customer-prices' && parts.length === 5) {
+        const prices = await database.customerProductPrice.findMany({
+          where: { isActive: true },
+          include: {
+            customer: { select: { id: true, name: true } },
+            vendor: { select: { id: true, name: true } },
+            product: { select: { id: true, name: true, sku: true } },
+          },
+          orderBy: { updatedAt: 'desc' },
+        });
+        sendJson(response, 200, prices);
+        return true;
+      }
+      if (method === 'POST' && parts[4] === 'cash-handovers' && parts.length === 5) {
+        const input = await body(request, cashHandoverSchema);
+        const idempotencyKey = getIdempotencyKey(request);
+        if (!idempotencyKey || idempotencyKey.length > 191) throw new HttpError(400, 'A valid idempotency key is required');
+        const vendors = await database.vendor.findMany({
+          where: { name: 'Rawat Farm', isActive: true, status: 'APPROVED' },
+          select: { id: true },
+        });
+        if (vendors.length !== 1) throw new HttpError(409, 'Exactly one active approved Rawat Farm vendor is required');
+        const vendorId = vendors[0]!.id;
+        const requestHash = hashRequestPayload({ vendorId, input });
+        const previous = await database.cashHandover.findUnique({ where: { idempotencyKey } });
+        if (previous) {
+          if (previous.receivedByUserId !== context.userId || previous.requestHash !== requestHash) {
+            throw new HttpError(409, 'Idempotency key was already used with a different request');
+          }
+          sendJson(response, 200, { idempotent: true, handover: previous });
+          return true;
+        }
+        let handover;
+        try {
+          handover = await database.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT \`userId\` FROM \`VendorUser\` WHERE \`userId\` = ${input.deliveryPartnerId} AND \`vendorId\` = ${vendorId} FOR UPDATE`;
+            const membership = await tx.vendorUser.findUnique({
+              where: { userId_vendorId: { userId: input.deliveryPartnerId, vendorId } },
+              include: { user: { include: { roles: { include: { role: true } } } } },
+            });
+            const canDeliver = Boolean(membership && (
+              membership.user.roles.some(({ role }) => ['DELIVERY_PARTNER', 'DELIVERY_STAFF'].includes(role.name))
+              || (Array.isArray(membership.capabilities) && membership.capabilities.includes('DELIVERY'))
+            ));
+            if (!membership?.isActive || membership.user.status !== 'ACTIVE' || !canDeliver) {
+              throw new HttpError(400, 'An active Rawat Farm delivery partner is required');
+            }
+            const [cash, priorHandovers] = await Promise.all([
+              tx.payment.aggregate({
+                where: { vendorId, deliveryPartnerId: input.deliveryPartnerId, method: 'CASH', status: 'CASH_COLLECTED' },
+                _sum: { amount: true },
+              }),
+              tx.cashHandover.aggregate({
+                where: { vendorId, deliveryPartnerId: input.deliveryPartnerId },
+                _sum: { amount: true },
+              }),
+            ]);
+            const availableCash = Number(cash._sum.amount ?? 0) - Number(priorHandovers._sum.amount ?? 0);
+            if (input.amount > availableCash) throw new HttpError(400, 'Handover amount exceeds available collected cash');
+            return tx.cashHandover.create({
+              data: {
+                handoverNumber: `CH-${Date.now()}-${randomUUID().slice(0, 8).toUpperCase()}`,
+                vendorId,
+                deliveryPartnerId: input.deliveryPartnerId,
+                receivedByUserId: context.userId,
+                amount: input.amount,
+                idempotencyKey,
+                requestHash,
+                notes: input.notes,
+              },
+              include: { deliveryPartner: { select: { id: true, name: true } }, receivedBy: { select: { id: true, name: true } } },
+            });
+          });
+        } catch (error) {
+          if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+            const raced = await database.cashHandover.findUnique({ where: { idempotencyKey } });
+            if (raced?.receivedByUserId === context.userId && raced.requestHash === requestHash) {
+              sendJson(response, 200, { idempotent: true, handover: raced });
+              return true;
+            }
+            throw new HttpError(409, 'Cash handover request conflicts with an existing record');
+          }
+          throw error;
+        }
+        await audit(database, context.userId, 'CREATE', 'CashHandover', handover.id, {
+          deliveryPartnerId: input.deliveryPartnerId,
+          amount: input.amount,
+        });
+        sendJson(response, 201, handover);
+        return true;
+      }
       if (method === 'GET' && parts[4] === 'vendors' && parts.length === 5) {
         const query = new URL(request.url ?? '/', 'http://localhost');
         const search = query.searchParams.get('search')?.trim();
         const status = query.searchParams.get('status');
         const vendors = await database.vendor.findMany({ where: { ...(status ? { status: status as never } : {}), ...(search ? { OR: [{ name: { contains: search } }, { contactEmail: { contains: search } }, { contactPhone: { contains: search } }] } : {}) }, include: { products: { where: { status: 'ACTIVE' }, select: { id: true } }, users: { select: { isActive: true, capabilities: true } }, _count: { select: { products: true, orders: true, users: true } } }, orderBy: { createdAt: 'desc' } });
-        sendJson(response, 200, vendors.map((vendor) => ({ ...vendor, setup: vendorSetup(vendor) })));
+          const vendorRecords = vendors.map((vendor) => ({ ...vendor, setup: vendorSetup(vendor) }));
+          sendJson(response, 200, isChildAdmin
+            ? vendorRecords.map(({ id, name, status, isActive, createdAt, setup, _count }) => ({ id, name, status, isActive, createdAt, setup, _count }))
+            : vendorRecords);
         return true;
       }
       if (method === 'POST' && parts[4] === 'vendors' && parts.length === 5) {
         const input = await body(request, adminVendorCreateSchema);
+        if (input.businessName === 'Rawat Farm' && await database.vendor.findFirst({ where: { name: 'Rawat Farm' }, select: { id: true } })) {
+          throw new HttpError(409, 'A Rawat Farm business record already exists');
+        }
+        if ('ownerUserId' in input) {
+          const owner = await database.user.findUnique({
+            where: { id: input.ownerUserId },
+            include: { roles: { include: { role: true } } },
+          });
+          if (!owner || owner.status !== 'ACTIVE') throw new HttpError(404, 'Active vendor admin account not found');
+          if (!owner.roles.some(({ role }) => ['SUPER_ADMIN', 'ADMIN'].includes(role.name))) {
+            throw new HttpError(400, 'An existing vendor admin must have an ADMIN or SUPER_ADMIN role');
+          }
+          const created = await database.$transaction(async (tx) => {
+            const vendor = await tx.vendor.create({
+              data: {
+                name: input.businessName,
+                contactEmail: owner.email,
+                contactPhone: owner.mobile,
+                address: input.address,
+                isActive: false,
+                status: 'PENDING',
+              },
+            });
+            await tx.vendorUser.create({ data: { userId: owner.id, vendorId: vendor.id, capabilities: ['ADMIN'] } });
+            return { vendor, user: { id: owner.id, name: owner.name, email: owner.email, mobile: owner.mobile } };
+          });
+          await audit(database, context.userId, 'CREATE', 'Vendor', created.vendor.id, { ownerUserId: owner.id, existingOwner: true, status: 'PENDING' });
+          sendJson(response, 201, created);
+          return true;
+        }
         const duplicate = await database.user.findFirst({ where: { OR: [{ email: input.email }, { mobile: input.phone }] }, select: { id: true } });
         if (duplicate) throw new HttpError(409, 'An account with that email or phone already exists');
         const role = await database.role.findUnique({ where: { name: 'VENDOR' } });
@@ -512,7 +1148,9 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         const vendor = await database.vendor.findUnique({ where: { id: vendorId }, include: { products: { where: { status: 'ACTIVE' }, select: { id: true } }, users: { select: { isActive: true, capabilities: true } }, _count: { select: { products: true, orders: true, users: true } } } });
         if (!vendor) throw new HttpError(404, 'Vendor not found');
         if (method === 'GET') {
-          sendJson(response, 200, { ...vendor, setup: vendorSetup(vendor) });
+          sendJson(response, 200, isChildAdmin
+            ? { id: vendor.id, name: vendor.name, status: vendor.status, isActive: vendor.isActive, createdAt: vendor.createdAt, setup: vendorSetup(vendor), _count: vendor._count }
+            : { ...vendor, setup: vendorSetup(vendor) });
           return true;
         }
       }
@@ -539,15 +1177,34 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         const search = query.searchParams.get('search')?.trim();
         const products = await database.product.findMany({ where: { vendorId: query.searchParams.get('vendorId') || undefined, ...(search ? { OR: [{ name: { contains: search } }, { sku: { contains: search } }] } : {}) }, include: { vendor: true, variants: true }, orderBy: { name: 'asc' } });
         const visible = products.map((product) => ({ ...product, ...stockDetails(product), variants: product.variants.map((variant) => ({ ...variant, ...stockDetails(variant) })) })).filter((product) => !status || product.stockStatus === status || product.variants.some((variant) => variant.stockStatus === status));
-        sendJson(response, 200, visible);
+        sendJson(response, 200, isChildAdmin
+          ? visible.map(({ vendor, ...product }) => ({ ...product, vendor: vendor ? { id: vendor.id, name: vendor.name } : null }))
+          : visible);
         return true;
       }
       if (method === 'GET' && parts[4] === 'delivery-partners' && parts.length === 5) {
-        sendJson(response, 200, await database.vendorUser.findMany({ include: { vendor: true, user: true }, orderBy: { assignedAt: 'desc' } }));
+        const partners = await database.vendorUser.findMany({ include: { vendor: true, user: { include: { roles: { include: { role: true } } } } }, orderBy: { assignedAt: 'desc' } });
+        sendJson(response, 200, isChildAdmin
+          ? partners.map(({ user, vendor, ...membership }) => ({
+            ...membership,
+            user: publicUser(user),
+            vendor: vendor ? { id: vendor.id, name: vendor.name, status: vendor.status, isActive: vendor.isActive } : null,
+          }))
+          : partners);
         return true;
       }
       if (method === 'GET' && parts[4] === 'payments' && parts.length === 5) {
-        sendJson(response, 200, await database.payment.findMany({ include: { vendor: true, order: true, receivedBy: true, deliveryPartner: true }, orderBy: { receivedAt: 'desc' } }));
+        const query = new URL(request.url ?? '/', 'http://localhost');
+        const rawatFarmOnly = query.searchParams.get('business') === 'rawat-farm';
+        const payments = await database.payment.findMany({ where: rawatFarmOnly ? { vendor: { is: { name: 'Rawat Farm' } } } : {}, include: { vendor: true, order: { include: { masterOrder: { include: { customer: { select: { name: true } } } } } }, receivedBy: true, deliveryPartner: true }, orderBy: { receivedAt: 'desc' } });
+        sendJson(response, 200, isChildAdmin
+          ? payments.map(({ vendor, receivedBy, deliveryPartner, ...payment }) => ({
+            ...payment,
+            vendor: vendor ? { id: vendor.id, name: vendor.name } : null,
+            receivedBy: receivedBy ? { id: receivedBy.id, name: receivedBy.name } : null,
+            deliveryPartner: deliveryPartner ? { id: deliveryPartner.id, name: deliveryPartner.name } : null,
+          }))
+          : payments);
         return true;
       }
     }
@@ -590,6 +1247,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
     if (parts[3] === 'addresses') {
       const context = await authenticate(request, database);
+      requireCustomer(context);
       if (method === 'GET' && parts.length === 4) {
         sendJson(response, 200, await database.customerAddress.findMany({ where: { userId: context.userId }, orderBy: { createdAt: 'desc' } }));
         return true;
@@ -615,6 +1273,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
     if (parts[3] === 'master-orders') {
       const context = await authenticate(request, database);
+      requireCustomer(context);
       if (method === 'GET' && parts.length === 4) {
         sendJson(response, 200, await database.masterOrder.findMany({ where: { customerId: context.userId }, include: { subOrders: { include: { vendor: true, items: true, payments: true, deliveries: { include: { assignments: { include: { user: true } } } } } } }, orderBy: { createdAt: 'desc' } }));
         return true;
@@ -646,6 +1305,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
           const assignment = delivery.assignments.find((item) => item.userId === context.userId);
           if (action === 'accept') {
             if (!assignment) throw new HttpError(403, 'This delivery is not assigned to you');
+            if (assignment.status !== 'ASSIGNED' || delivery.order.status !== 'ASSIGNED') throw new HttpError(400, 'Delivery is not awaiting acceptance');
             const updated = await database.deliveryAssignment.updateMany({ where: { deliveryId: delivery.id, userId: context.userId }, data: { status: 'ACCEPTED' } });
             sendJson(response, 200, updated);
             return true;
@@ -663,17 +1323,29 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
           }
           if (action === 'complete') {
             const input = await body(request, deliveryCompletionSchema);
+            const idem = await assertInventoryIdempotency(database, request, context, { orderId: delivery.orderId, action: 'delivery-complete', input });
+            if (idem) {
+              sendJson(response, 200, { idempotent: true, orderId: delivery.orderId });
+              return true;
+            }
             const partnerAccess = await database.vendorUser.findUnique({ where: { userId_vendorId: { userId: context.userId, vendorId: delivery.order.vendorId! } } });
             const capabilities = Array.isArray(partnerAccess?.capabilities) ? partnerAccess.capabilities : [];
-            if ((input.payment === 'CASH' || input.payment === 'UPI') && !context.roles.includes('SUPER_ADMIN') && !capabilities.includes('PAYMENT_COLLECTION')) throw new HttpError(403, 'Payment collection capability is required');
+            if ((input.payment === 'CASH' || input.payment === 'UPI') && (!partnerAccess?.isActive || (!context.roles.includes('SUPER_ADMIN') && !capabilities.includes('PAYMENT_COLLECTION')))) throw new HttpError(403, 'Payment collection capability is required');
             if (delivery.order.status !== 'OUT_FOR_DELIVERY') throw new HttpError(400, 'Order is not out for delivery');
+            if (assignment?.status !== 'IN_PROGRESS') throw new HttpError(400, 'Start the delivery before completing it');
             if (input.payment === 'UPI' && !input.referenceNumber) throw new HttpError(400, 'UPI reference number is required');
-            const paymentSummary = buildPaymentSummary(delivery.order.totalAmount, delivery.order.payments, delivery.order.orderDate);
-            const amount = Number(input.amount ?? paymentSummary.outstanding);
-            if ((input.payment === 'CASH' || input.payment === 'UPI') && amount > paymentSummary.outstanding) throw new HttpError(400, 'Collected amount cannot exceed the outstanding balance');
-            if ((input.payment === 'CASH' || input.payment === 'UPI') && amount <= 0) throw new HttpError(400, 'Collected amount must be greater than zero');
+            if (!delivery.order.vendor) throw new HttpError(404, 'Marketplace vendor not found');
+            if (input.payment === 'CASH' || input.payment === 'UPI') assertPaymentMethodEnabled(delivery.order.vendor, input.payment);
             const result = await database.$transaction(async (tx) => {
-              if (input.payment === 'CASH' || input.payment === 'UPI') await tx.payment.create({ data: { shopId: delivery.order.shopId, orderId: delivery.orderId, vendorId: delivery.order.vendorId, amount, method: input.payment, status: input.payment === 'CASH' ? 'CASH_COLLECTED' : 'UPI_COLLECTED', referenceNumber: input.referenceNumber, paidAt: new Date(), receivedAt: new Date(), receivedByUserId: context.userId, deliveryPartnerId: context.userId, notes: input.notes } });
+              if (input.payment === 'CASH' || input.payment === 'UPI') {
+                await lockOrderForPayment(tx, delivery.orderId);
+                const payments = await tx.payment.findMany({ where: { orderId: delivery.orderId } });
+                const paymentSummary = buildPaymentSummary(delivery.order.totalAmount, payments, delivery.order.orderDate);
+                const amount = Number(input.amount ?? paymentSummary.outstanding);
+                if (amount > paymentSummary.outstanding) throw new HttpError(400, 'Collected amount cannot exceed the outstanding balance');
+                if (amount <= 0) throw new HttpError(400, 'Collected amount must be greater than zero');
+                await tx.payment.create({ data: { shopId: delivery.order.shopId, orderId: delivery.orderId, vendorId: delivery.order.vendorId, amount, method: input.payment, status: input.payment === 'CASH' ? 'CASH_COLLECTED' : 'UPI_COLLECTED', referenceNumber: input.referenceNumber, paidAt: new Date(), receivedAt: new Date(), receivedByUserId: context.userId, deliveryPartnerId: context.userId, notes: input.notes } });
+              }
               const updatedDelivery = await tx.delivery.update({ where: { id: delivery.id }, data: { status: 'DELIVERED', deliveredAt: new Date(), deliveredByUserId: context.userId, deliveryNotes: input.notes } });
               const updatedOrder = await tx.order.update({ where: { id: delivery.orderId }, data: { status: 'DELIVERED', deliveredAt: new Date(), statusHistory: { create: [{ previousStatus: delivery.order.status, newStatus: 'DELIVERED', changedBy: context.userId, reason: 'DELIVERY_COMPLETED' }] } } });
               return { delivery: updatedDelivery, order: updatedOrder };
@@ -688,12 +1360,32 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     if (method === 'GET' && parts[3] === 'products' && parts.length === 4) {
       const query = new URL(request.url ?? '/', 'http://localhost');
       const search = query.searchParams.get('search')?.trim();
+      const authenticated = request.headers.authorization ? await authenticate(request, database) : null;
+      const customerId = authenticated?.roles.includes('CUSTOMER') ? authenticated.userId : undefined;
       const products = await database.product.findMany({
         where: { status: 'ACTIVE', vendor: { is: { isActive: true, status: 'APPROVED' } }, ...(search ? { OR: [{ name: { contains: search } }, { description: { contains: search } }] } : {}) },
-        include: { vendor: true, category: true, unit: true, variants: { where: { status: 'ACTIVE' }, include: { unit: true } }, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
+        include: { vendor: true, category: true, unit: true, variants: { where: { status: 'ACTIVE' }, include: { unit: true } } },
         orderBy: { name: 'asc' },
       });
-      const productsWithPrices = await Promise.all(products.map(async (product) => ({ id: product.id, name: product.name, description: product.description, imageUrl: product.imageUrl, sku: product.sku, vendor: product.vendor, category: product.category, unit: product.unit, price: (await database.productPrice.findFirst({ where: { productId: product.id, shopId: null }, orderBy: { validFrom: 'desc' } }))?.price ?? null, stockStatus: stockStatus(product.stockQuantity, product.lowStockThreshold, product.trackInventory), variants: product.variants?.map((variant) => ({ id: variant.id, name: variant.name, sku: variant.sku, unit: variant.unit, stockStatus: stockStatus(variant.stockQuantity, variant.lowStockThreshold, variant.trackInventory) })) ?? [] })));
+      const productsWithPrices = await Promise.all(products.map(async (product) => {
+        const effective = await findMarketplacePrice(database, { customerId, vendorId: product.vendorId ?? '', productId: product.id });
+        return {
+          id: product.id,
+          name: product.name,
+          description: product.description,
+          imageUrl: product.imageUrl,
+          sku: product.sku,
+          vendor: product.vendor,
+          category: product.category,
+          unit: product.unit,
+          minOrderQuantity: product.minOrderQuantity,
+          price: effective?.price ?? null,
+          priceSource: effective?.source ?? 'UNAVAILABLE',
+          availableForPurchase: effective !== null,
+          stockStatus: stockStatus(product.stockQuantity, product.lowStockThreshold, product.trackInventory),
+          variants: product.variants?.map((variant) => ({ id: variant.id, name: variant.name, sku: variant.sku, unit: variant.unit, stockStatus: stockStatus(variant.stockQuantity, variant.lowStockThreshold, variant.trackInventory) })) ?? [],
+        };
+      }));
       sendJson(response, 200, productsWithPrices);
       return true;
     }
@@ -705,7 +1397,11 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
     if (method === 'POST' && parts[3] === 'vendors' && parts.length === 4) {
       const context = await authAndPermission(request, database, 'vendors.manage');
-      const vendor = await database.vendor.create({ data: await body(request, vendorSchema) });
+      const settings = await body(request, vendorSchema);
+      if (settings.upiCollectionEnabled === true && !upiIdSchema.safeParse(settings.upiId).success) {
+        throw new HttpError(400, 'A valid UPI ID/VPA is required before enabling UPI collection');
+      }
+      const vendor = await database.vendor.create({ data: settings });
       await audit(database, context.userId, 'CREATE', 'Vendor', vendor.id);
       sendJson(response, 201, vendor);
       return true;
@@ -722,6 +1418,14 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         sendJson(response, 200, products.map((product) => ({ ...product, ...stockDetails(product), variants: product.variants.map((variant) => ({ ...variant, ...stockDetails(variant) })) })));
         return true;
       }
+      if (method === 'GET' && parts[5] === 'product-options' && parts.length === 6) {
+        const [categories, units] = await Promise.all([
+          database.category.findMany({ where: { isActive: true }, select: { id: true, name: true }, orderBy: { name: 'asc' } }),
+          database.unit.findMany({ where: { isActive: true }, select: { id: true, name: true, code: true }, orderBy: { name: 'asc' } }),
+        ]);
+        sendJson(response, 200, { categories, units });
+        return true;
+      }
       if (method === 'GET' && parts[5] === 'products' && parts.length === 8 && parts[7] === 'inventory') {
         const productId = idFrom(parts, 6);
         const product = await database.product.findFirst({ where: { id: productId, vendorId }, include: { variants: true } });
@@ -734,6 +1438,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         const productId = idFrom(parts, 6);
         const input = await body(request, stockAdjustmentSchema);
         const result = await database.$transaction(async (tx) => {
+          await tx.$queryRaw`SELECT id FROM \`Product\` WHERE id = ${productId} AND \`vendorId\` = ${vendorId} FOR UPDATE`;
           const current = await tx.product.findFirst({ where: { id: productId, vendorId } });
           if (!current) throw new HttpError(404, 'Product not found');
           const quantity = new Prisma.Decimal(input.quantity);
@@ -756,7 +1461,14 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         return true;
       }
       if (method === 'POST' && parts[5] === 'products' && parts.length === 6) {
-        const product = await database.product.create({ data: { ...(await body(request, productSchema)), vendorId } });
+        const { initialStockQuantity = 0, ...productInput } = await body(request, vendorProductCreateSchema);
+        const product = await database.$transaction(async (tx) => {
+          const created = await tx.product.create({ data: { ...productInput, vendorId, stockQuantity: initialStockQuantity } });
+          if (initialStockQuantity > 0) {
+            await tx.stockMovement.create({ data: { vendorId, productId: created.id, quantityDelta: initialStockQuantity, movementType: 'INITIAL_STOCK', reason: 'Opening stock at product creation', stockBefore: 0, stockAfter: initialStockQuantity, createdByUserId: context.userId } });
+          }
+          return created;
+        });
         await audit(database, context.userId, 'CREATE', 'Product', product.id, { vendorId });
         sendJson(response, 201, product);
         return true;
@@ -802,12 +1514,20 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         return true;
       }
       if (method === 'GET' && parts[5] === 'payment-settings' && parts.length === 6) {
-        sendJson(response, 200, await database.vendor.findUnique({ where: { id: vendorId }, select: { id: true, name: true, imageUrl: true, contactPhone: true, contactEmail: true, address: true, upiId: true, paymentDisplayName: true, qrImageUrl: true, cashCollectionEnabled: true, upiCollectionEnabled: true, paymentInstructions: true } }));
+        const settings = await database.vendor.findUnique({ where: { id: vendorId }, select: { id: true, name: true, imageUrl: true, contactPhone: true, contactEmail: true, address: true, upiId: true, upiAccountLast4: true, paymentDisplayName: true, qrImageUrl: true, cashCollectionEnabled: true, upiCollectionEnabled: true, paymentInstructions: true } });
+        sendSensitiveJson(response, 200, settings ? { ...settings, upiCollectionEnabled: settings.upiCollectionEnabled && upiIdSchema.safeParse(settings.upiId).success } : null);
         return true;
       }
       if (method === 'PATCH' && parts[5] === 'payment-settings' && parts.length === 6) {
         const settings = await body(request, vendorSettingsSchema);
-        sendJson(response, 200, await database.vendor.update({ where: { id: vendorId }, data: settings, select: { id: true, name: true, imageUrl: true, contactPhone: true, contactEmail: true, address: true, upiId: true, paymentDisplayName: true, qrImageUrl: true, cashCollectionEnabled: true, upiCollectionEnabled: true, paymentInstructions: true } }));
+        const currentSettings = await database.vendor.findUnique({ where: { id: vendorId }, select: { upiId: true, upiCollectionEnabled: true } });
+        if (!currentSettings) throw new HttpError(404, 'Vendor not found');
+        const nextUpiId = settings.upiId === undefined ? currentSettings.upiId : settings.upiId;
+        const nextUpiEnabled = settings.upiCollectionEnabled ?? currentSettings.upiCollectionEnabled;
+        if (nextUpiEnabled && !upiIdSchema.safeParse(nextUpiId).success) {
+          throw new HttpError(400, 'A valid UPI ID/VPA is required before enabling UPI collection');
+        }
+        sendSensitiveJson(response, 200, await database.vendor.update({ where: { id: vendorId }, data: settings, select: { id: true, name: true, imageUrl: true, contactPhone: true, contactEmail: true, address: true, upiId: true, upiAccountLast4: true, paymentDisplayName: true, qrImageUrl: true, cashCollectionEnabled: true, upiCollectionEnabled: true, paymentInstructions: true } }));
         return true;
       }
       if (parts[5] === 'collections' && parts.length === 6 && method === 'GET') {
@@ -838,6 +1558,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
     if (method === 'POST' && parts[3] === 'orders' && parts.length === 4) {
       const context = await authenticate(request, database);
+      requireCustomer(context);
       const input = await body(request, marketplaceOrderSchema);
       const idempotencyKey = getIdempotencyKey(request);
       const requestHash = hashRequestPayload(input);
@@ -867,17 +1588,28 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       if (input.addressId && !selectedAddress) throw new HttpError(404, 'Delivery address not found');
       if (!selectedAddress) throw new HttpError(400, 'A delivery address is required');
       const addressSnapshot = [selectedAddress.line1, selectedAddress.line2, selectedAddress.city, selectedAddress.state, selectedAddress.postalCode].filter(Boolean).join(', ');
-      const grouped = new Map<string, Array<{ input: (typeof input.items)[number]; product: { id: string; unitId: string; name: string; sku: string; unit: { code: string } }; variant: { id: string; unitId: string; name: string; sku: string; unit: { code: string } } | null; price: number }>>();
+      type MarketplacePricedItem = {
+        input: (typeof input.items)[number] & { unitId: string };
+        product: { id: string; unitId: string; name: string; sku: string; unit: { code: string } };
+        variant: { id: string; unitId: string; name: string; sku: string; unit: { code: string } } | null;
+        price: number;
+      };
+      const grouped = new Map<string, MarketplacePricedItem[]>();
       for (const item of input.items) {
         const product = await database.product.findUnique({ where: { id: item.productId }, include: { unit: true, vendor: true } });
         if (!product || product.status !== 'ACTIVE' || !product.vendorId || !product.vendor?.isActive || product.vendor.status !== 'APPROVED') throw new HttpError(400, `Product is unavailable: ${item.productId}`);
         const variant = item.variantId ? await database.productVariant.findUnique({ where: { id: item.variantId }, include: { unit: true } }) : null;
         if (item.variantId && (!variant || variant.productId !== product.id || variant.status !== 'ACTIVE')) throw new HttpError(400, 'Variant is unavailable');
+        if (product.minOrderQuantity && new Prisma.Decimal(item.quantity).lt(product.minOrderQuantity)) throw new HttpError(400, `Minimum order quantity for ${product.name} is ${product.minOrderQuantity.toString()}`);
+        const unitId = variant?.unitId ?? product.unitId;
+        if (item.unitId && item.unitId !== unitId) throw new HttpError(400, `Order unit does not match ${product.name}`);
+        const unitPrecision = variant?.unit.precision ?? product.unit.precision;
+        if (new Prisma.Decimal(item.quantity).decimalPlaces() > unitPrecision) throw new HttpError(400, `Quantity precision does not match the unit for ${product.name}`);
         const availableProduct = product;
-        const price = await database.productPrice.findFirst({ where: item.variantId ? { variantId: item.variantId, shopId: null } : { productId: item.productId, shopId: null }, orderBy: { validFrom: 'desc' } });
+        const price = await findMarketplacePrice(database, { customerId: context.userId, vendorId: product.vendorId, productId: item.productId, variantId: item.variantId });
         if (!price) throw new HttpError(400, `Pricing is unavailable for ${product.name}`);
         const items = grouped.get(product.vendorId) ?? [];
-        items.push({ input: item, product: availableProduct, variant, price: Number(price.price) });
+        items.push({ input: { ...item, unitId }, product: availableProduct, variant, price: Number(price.price) });
         grouped.set(product.vendorId, items);
       }
       const totalAmount = Array.from(grouped.values()).flat().reduce((sum, item) => sum + item.price * item.input.quantity, 0);
@@ -899,7 +1631,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
               totalAmount: subtotal,
               orderDate: new Date(),
               placedAt: new Date(),
-              items: { create: items.map(({ input: item, product, variant, price }) => ({ productId: product.id, variantId: variant?.id, unitId: item.unitId ?? variant?.unitId ?? product.unitId, productNameSnapshot: product.name, variantNameSnapshot: variant?.name ?? product.name, skuSnapshot: variant?.sku ?? product.sku, unitSnapshot: variant?.unit.code ?? product.unit.code, orderedQuantity: item.quantity, unitPrice: price, lineTotal: price * item.quantity, notes: item.notes })) },
+              items: { create: items.map(({ input: item, product, variant, price }) => ({ productId: product.id, variantId: variant?.id, unitId: item.unitId, productNameSnapshot: product.name, variantNameSnapshot: variant?.name ?? product.name, skuSnapshot: variant?.sku ?? product.sku, unitSnapshot: variant?.unit.code ?? product.unit.code, orderedQuantity: item.quantity, unitPrice: price, lineTotal: price * item.quantity, notes: item.notes })) },
               statusHistory: { create: [{ newStatus: 'PLACED', changedBy: context.userId, reason: 'MARKETPLACE_CHECKOUT' }] },
             },
             include: { items: true },
@@ -923,16 +1655,24 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     if (parts[3] === 'orders' && parts.length >= 5) {
       const orderId = idFrom(parts, 4);
       const context = await authenticate(request, database);
-      const order = await database.order.findUnique({ where: { id: orderId }, include: { vendor: true, items: true, deliveries: { include: { assignments: true } }, payments: true } });
+      const order = await database.order.findUnique({ where: { id: orderId }, include: { vendor: true, items: true, deliveries: { include: { assignments: { include: { user: true } } } }, payments: { include: { receivedBy: true, deliveryPartner: true } }, masterOrder: { include: { customer: { select: { name: true, mobile: true, email: true } } } } } });
       if (!order?.vendorId) throw new HttpError(404, 'Marketplace order not found');
+      if (!order.vendor) throw new HttpError(404, 'Marketplace vendor not found');
       const scopedVendorId = await vendorIdForContext(context, database);
       if (scopedVendorId && scopedVendorId !== order.vendorId) throw new HttpError(403, 'Order is outside your vendor scope');
       const isDeliveryActor = isDeliveryRole(context.roles);
-      if (isDeliveryActor && !context.roles.includes('SUPER_ADMIN')) await ensureAssignedDelivery(database, orderId, context.userId);
+      const isPaymentCollectionAction = method === 'POST' && parts[5] === 'collect-payment' && parts.length === 6;
+      if (isDeliveryActor && !context.roles.includes('SUPER_ADMIN') && !isPaymentCollectionAction) await ensureAssignedDelivery(database, orderId, context.userId);
       if (!scopedVendorId && !isDeliveryActor && !context.roles.includes('SUPER_ADMIN') && order.customerId !== context.userId) throw new HttpError(403, 'Order is not accessible to this user');
 
       if (method === 'POST' && parts[5] === 'status' && parts.length === 6) {
+        if (!isAdminLike(context.roles) && !isVendorRole(context.roles)) throw new HttpError(403, 'Vendor access is required');
         const input = await body(request, { parse: (value: unknown) => ({ status: String((value as { status?: string }).status ?? '') }) });
+        const idem = await assertInventoryIdempotency(database, request, context, { orderId, action: 'status', input });
+        if (idem) {
+          sendJson(response, 200, { idempotent: true, orderId, status: order.status });
+          return true;
+        }
         const allowed = ['CONFIRMED', 'PICKING', 'PACKED', 'CANCELLED'];
         if (!allowed.includes(input.status) || !isValidStatusTransition(order.status, input.status)) throw new HttpError(400, 'Invalid order status transition');
         const updated = await database.order.update({ where: { id: orderId }, data: { status: input.status as never, ...(input.status === 'CONFIRMED' ? { confirmedAt: new Date() } : {}), ...(input.status === 'PACKED' ? { packedAt: new Date() } : {}), statusHistory: { create: [{ previousStatus: order.status, newStatus: input.status as never, changedBy: context.userId, reason: 'VENDOR_STATUS_UPDATE' }] } } });
@@ -942,6 +1682,11 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
       if (method === 'POST' && parts[5] === 'assignment' && parts.length === 6) {
         const input = await body(request, assignmentSchema);
+        const idem = await assertInventoryIdempotency(database, request, context, { orderId, action: 'assignment', input });
+        if (idem) {
+          sendJson(response, 200, { idempotent: true, orderId });
+          return true;
+        }
         if (order.status !== 'PACKED') throw new HttpError(400, 'Order must be packed before assignment');
         const assignee = await database.vendorUser.findUnique({ where: { userId_vendorId: { userId: input.userId, vendorId: order.vendorId } }, include: { user: { include: { roles: { include: { role: true } } } } } });
         const capabilities = Array.isArray(assignee?.capabilities) ? assignee.capabilities : [];
@@ -955,12 +1700,46 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
       if (method === 'POST' && parts[5] === 'collect-payment' && parts.length === 6) {
         if (!isDeliveryRole(context.roles) && !context.roles.includes('SUPER_ADMIN')) throw new HttpError(403, 'Payment collection capability is required');
         const input = await body(request, paymentCollectionSchema);
-        const paymentSummary = buildPaymentSummary(order.totalAmount, order.payments, order.orderDate);
-        if (input.amount > paymentSummary.outstanding) throw new HttpError(400, 'Collected amount cannot exceed the outstanding balance');
-        if (paymentSummary.outstanding <= 0) throw new HttpError(400, 'Order is already fully paid');
+        if (order.vendor.name !== 'Rawat Farm' || !isVendorOperational(order.vendor)) {
+          throw new HttpError(403, 'Payment collection is limited to the active approved Rawat Farm vendor');
+        }
+        await requirePaymentCollectionCapability(database, context.userId, order.vendorId, context.roles.includes('SUPER_ADMIN'));
+        assertPaymentMethodEnabled(order.vendor, input.method);
+        if (order.status === 'CANCELLED') throw new HttpError(400, 'Payment cannot be collected for a cancelled order');
         if (input.method === 'UPI' && !input.referenceNumber) throw new HttpError(400, 'UPI reference number is required');
-        const payment = await database.payment.create({ data: { shopId: order.shopId, orderId, vendorId: order.vendorId, amount: input.amount, method: input.method, status: input.method === 'CASH' ? 'CASH_COLLECTED' : 'UPI_COLLECTED', referenceNumber: input.referenceNumber, paidAt: new Date(), receivedAt: new Date(), receivedByUserId: context.userId, deliveryPartnerId: context.userId, notes: input.notes } });
-        sendJson(response, 201, { payment, summary: buildPaymentSummary(order.totalAmount, [...order.payments, payment], order.orderDate) });
+        const idempotencyKey = getIdempotencyKey(request);
+        if (!idempotencyKey || idempotencyKey.length > 191) throw new HttpError(400, 'A valid idempotency key is required');
+        const result = await database.$transaction(async (tx) => {
+          await lockOrderForPayment(tx, orderId);
+          const requestHash = hashRequestPayload({ orderId, action: 'collect-payment', input });
+          const existingKey = await tx.idempotencyKey.findUnique({ where: { key: idempotencyKey } });
+          if (existingKey) {
+            if (existingKey.userId !== context.userId || existingKey.requestHash !== requestHash) {
+              throw new HttpError(409, 'Idempotency key was already used with a different request');
+            }
+            const payments = await tx.payment.findMany({ where: { orderId } });
+            return { idempotent: true as const, orderId, payments, summary: buildPaymentSummary(order.totalAmount, payments, order.orderDate) };
+          }
+          try {
+            await tx.idempotencyKey.create({ data: { key: idempotencyKey, userId: context.userId, requestHash } });
+          } catch (error) {
+            if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+              throw new HttpError(409, 'Idempotency key is already in use');
+            }
+            throw error;
+          }
+          const payments = await tx.payment.findMany({ where: { orderId } });
+          const paymentSummary = buildPaymentSummary(order.totalAmount, payments, order.orderDate);
+          if (input.amount > paymentSummary.outstanding) throw new HttpError(400, 'Collected amount cannot exceed the outstanding balance');
+          if (paymentSummary.outstanding <= 0) throw new HttpError(400, 'Order is already fully paid');
+          const payment = await tx.payment.create({ data: { shopId: order.shopId, orderId, vendorId: order.vendorId, amount: input.amount, method: input.method, status: input.method === 'CASH' ? 'CASH_COLLECTED' : 'UPI_COLLECTED', referenceNumber: input.referenceNumber, paidAt: new Date(), receivedAt: new Date(), receivedByUserId: context.userId, deliveryPartnerId: context.userId, notes: input.notes } });
+          return { payment, summary: buildPaymentSummary(order.totalAmount, [...payments, payment], order.orderDate) };
+        });
+        if ('idempotent' in result) {
+          sendJson(response, 200, result);
+          return true;
+        }
+        sendJson(response, 201, result);
         return true;
       }
 
@@ -980,14 +1759,15 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     if (!schema) throw new HttpError(404, 'Catalog route not found');
     const permissionResource = resource === 'prices' ? 'catalog.prices' : `catalog.${resource}`;
     if (method === 'GET' && parts.length === 4) {
-      await authAndPermission(request, database, `${permissionResource}.read`);
+      const context = await authAndPermission(request, database, `${permissionResource}.read`);
       if (resourceName === 'products') {
         const query = new URL(request.url ?? '/', 'http://localhost');
         const status = query.searchParams.get('status');
         const search = query.searchParams.get('search')?.trim();
         const vendorId = query.searchParams.get('vendorId');
+        const rawatFarmOnly = context.roles.includes('CHILD_ADMIN') || query.searchParams.get('business') === 'rawat-farm';
         const products = await database.product.findMany({
-          where: { ...(status ? { status: status as never } : {}), ...(vendorId ? { vendorId } : {}), ...(search ? { OR: [{ name: { contains: search } }, { sku: { contains: search } }] } : {}) },
+          where: { ...(status ? { status: status as never } : {}), ...(vendorId ? { vendorId } : {}), ...(rawatFarmOnly ? { vendor: { is: { name: 'Rawat Farm' } } } : {}), ...(search ? { OR: [{ name: { contains: search } }, { sku: { contains: search } }] } : {}) },
           include: { vendor: true, category: true, unit: true, variants: { include: { unit: true } }, prices: { where: { shopId: null }, orderBy: { validFrom: 'desc' }, take: 1 } },
           orderBy: { name: 'asc' },
         });
@@ -998,7 +1778,25 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
           stockStatus: stockStatus(product.stockQuantity, product.lowStockThreshold, product.trackInventory),
           variants: product.variants.map((variant) => ({ ...variant, stockStatus: stockStatus(variant.stockQuantity, variant.lowStockThreshold, variant.trackInventory) })),
         }));
-        sendJson(response, 200, productsWithVendor);
+        sendJson(response, 200, context.roles.includes('CHILD_ADMIN')
+          ? productsWithVendor.map((product) => ({
+            id: product.id,
+            categoryId: product.categoryId,
+            unitId: product.unitId,
+            name: product.name,
+            sku: product.sku,
+            description: product.description,
+            status: product.status,
+            minOrderQuantity: product.minOrderQuantity,
+            vendorId: product.vendorId,
+            vendorName: product.vendorName,
+            imageUrl: product.imageUrl,
+            ...(context.permissions.includes('catalog.prices.read') ? { price: product.price } : {}),
+            category: product.category,
+            unit: product.unit,
+            vendor: product.vendor ? { id: product.vendor.id, name: product.vendor.name } : null,
+          }))
+          : productsWithVendor);
         return true;
       }
       const delegate = { categories: database.category, units: database.unit, products: database.product, variants: database.productVariant, prices: database.productPrice }[resourceName as keyof typeof schemas];
@@ -1007,6 +1805,47 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     }
     if (method === 'POST' && parts.length === 4) {
       const context = await authAndPermission(request, database, `${permissionResource}.create`);
+      if (resourceName === 'products') {
+        if (!isAdminLike(context.roles)) throw new HttpError(403, 'Admin access is required to create products');
+        const parsedInput = await body(request, adminProductCreateSchema);
+        if (context.roles.includes('CHILD_ADMIN') && (parsedInput.trackInventory !== undefined || parsedInput.initialStockQuantity !== undefined)) {
+          throw new HttpError(403, 'Child Admins cannot manage product inventory');
+        }
+        if (context.roles.includes('CHILD_ADMIN') && parsedInput.price !== undefined) requirePermission(context, 'catalog.prices.create');
+        if (!context.roles.includes('CHILD_ADMIN') && parsedInput.price === undefined) throw new HttpError(400, 'Product price is required');
+        const { price, initialStockQuantity = 0, ...input } = parsedInput;
+        const rawatFarmVendors = await database.vendor.findMany({
+          where: { name: 'Rawat Farm', isActive: true, status: 'APPROVED' },
+          select: { id: true },
+        });
+        if (rawatFarmVendors.length !== 1) throw new HttpError(409, 'Exactly one active Rawat Farm business record must be configured before products can be added');
+        const record = await database.$transaction(async (tx) => {
+          const stockQuantity = input.trackInventory === false ? 0 : initialStockQuantity;
+          const product = await tx.product.create({ data: { ...input, vendorId: rawatFarmVendors[0]!.id, stockQuantity } });
+          if (price !== undefined) await tx.productPrice.create({ data: { productId: product.id, price, validFrom: new Date() } });
+          if (stockQuantity > 0) {
+            await tx.stockMovement.create({ data: { vendorId: rawatFarmVendors[0]!.id, productId: product.id, quantityDelta: stockQuantity, movementType: 'INITIAL_STOCK', reason: 'Opening stock at product creation', stockBefore: 0, stockAfter: stockQuantity, createdByUserId: context.userId } });
+          }
+          return product;
+        });
+        await audit(database, context.userId, 'CREATE', 'Product', record.id, price === undefined ? undefined : { price });
+        sendJson(response, 201, context.roles.includes('CHILD_ADMIN')
+          ? {
+            id: record.id,
+            categoryId: record.categoryId,
+            unitId: record.unitId,
+            name: record.name,
+            sku: record.sku,
+            description: record.description,
+            status: record.status,
+            minOrderQuantity: record.minOrderQuantity,
+            vendorId: record.vendorId,
+            imageUrl: record.imageUrl,
+            ...(context.permissions.includes('catalog.prices.read') && price !== undefined ? { price } : {}),
+          }
+          : record);
+        return true;
+      }
       const input = await body(request, schema);
       const delegate = { categories: database.category, units: database.unit, products: database.product, variants: database.productVariant, prices: database.productPrice }[resourceName as keyof typeof schemas];
       const record = await (delegate as { create(args: unknown): Promise<{ id: string }> }).create({ data: input });
@@ -1017,11 +1856,71 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
     if (method === 'PATCH' && parts.length === 5) {
       const context = await authAndPermission(request, database, `${permissionResource}.update`);
       const recordId = idFrom(parts, 4);
+      if (resourceName === 'products') {
+        if (!isAdminLike(context.roles)) throw new HttpError(403, 'Admin access is required to update products');
+        const { price, ...input } = await body(request, adminProductUpdateSchema);
+        if (context.roles.includes('CHILD_ADMIN') && input.trackInventory !== undefined) {
+          throw new HttpError(403, 'Child Admins cannot manage product inventory');
+        }
+        if (context.roles.includes('CHILD_ADMIN') && price !== undefined) requirePermission(context, 'catalog.prices.update');
+        if (Object.keys(input).length === 0 && price === undefined) throw new HttpError(400, 'Product update is required');
+        const result = await database.$transaction(async (tx) => {
+          const currentProduct = await tx.product.findUnique({ where: { id: recordId } });
+          if (!currentProduct) throw new HttpError(404, 'Product not found');
+          if (context.roles.includes('CHILD_ADMIN')) {
+            const childAdminProduct = await tx.product.findFirst({ where: { id: recordId, vendor: { is: { name: 'Rawat Farm' } } }, select: { id: true } });
+            if (!childAdminProduct) throw new HttpError(404, 'Product not found');
+          }
+          const product = Object.keys(input).length > 0
+            ? await tx.product.update({ where: { id: recordId }, data: input })
+            : currentProduct;
+          if (price !== undefined) {
+            const validFrom = new Date();
+            const currentPrice = await tx.productPrice.findFirst({
+              where: { productId: recordId, shopId: null },
+              orderBy: { validFrom: 'desc' },
+            });
+            if (currentPrice) await tx.productPrice.update({ where: { id: currentPrice.id }, data: { validTo: validFrom } });
+            await tx.productPrice.create({ data: { productId: recordId, price, validFrom } });
+          }
+          return product;
+        });
+        await audit(database, context.userId, 'UPDATE', 'Product', recordId, price === undefined ? input : { ...input, price });
+        sendJson(response, 200, context.roles.includes('CHILD_ADMIN')
+          ? {
+            id: result.id,
+            categoryId: result.categoryId,
+            unitId: result.unitId,
+            name: result.name,
+            sku: result.sku,
+            description: result.description,
+            status: result.status,
+            minOrderQuantity: result.minOrderQuantity,
+            vendorId: result.vendorId,
+            imageUrl: result.imageUrl,
+          }
+          : result);
+        return true;
+      }
       const input = await body(request, schema);
       const delegate = { categories: database.category, units: database.unit, products: database.product, variants: database.productVariant, prices: database.productPrice }[resourceName as keyof typeof schemas];
       const record = await (delegate as { update(args: unknown): Promise<{ id: string }> }).update({ where: { id: recordId }, data: input });
       await audit(database, context.userId, 'UPDATE', resourceName, recordId);
       sendJson(response, 200, record);
+      return true;
+    }
+    if (method === 'DELETE' && resourceName === 'products' && parts.length === 5) {
+      const context = await authAndPermission(request, database, 'catalog.products.update');
+      if (!isAdminLike(context.roles)) throw new HttpError(403, 'Admin access is required to remove products');
+      const productId = idFrom(parts, 4);
+      const product = context.roles.includes('CHILD_ADMIN')
+        ? await database.product.findFirst({ where: { id: productId, vendor: { is: { name: 'Rawat Farm' } } }, select: { id: true, name: true, status: true } })
+        : await database.product.findUnique({ where: { id: productId }, select: { id: true, name: true, status: true } });
+      if (!product) throw new HttpError(404, 'Product not found');
+      const historicalOrderCount = await database.orderItem.count({ where: { productId } });
+      const archivedProduct = await database.product.update({ where: { id: productId }, data: { status: 'INACTIVE' } });
+      await audit(database, context.userId, 'DELETE', 'Product', productId, { archived: true, historicalOrderCount });
+      sendJson(response, 200, { id: archivedProduct.id, status: archivedProduct.status, historicalOrderCount });
       return true;
     }
   }
@@ -1427,6 +2326,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
   if (parts[2] === 'orders') {
     if (method === 'GET' && parts.length === 3) {
       const context = await authenticate(request, database);
+      requirePermission(context, 'orders.read');
       const query = new URL(request.url ?? '/', 'http://localhost');
       const shopId = query.searchParams.get('shopId') ?? undefined;
       if (!isAdminLike(context.roles)) {
@@ -1434,6 +2334,7 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         await ensureShopAccess(context, database, shopId);
       }
       const where: Record<string, unknown> = shopId ? { shopId } : {};
+      if (query.searchParams.get('business') === 'rawat-farm') where.vendor = { is: { name: 'Rawat Farm' } };
       if (query.searchParams.get('orderNumber')) where.orderNumber = { contains: query.searchParams.get('orderNumber')! };
       if (query.searchParams.get('status')) where.status = query.searchParams.get('status') as never;
       if (query.searchParams.get('shopId')) where.shopId = query.searchParams.get('shopId')!;
@@ -1455,10 +2356,22 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
         skip: (page - 1) * pageSize,
         take: pageSize,
         orderBy: { [sortField]: sortDirection } as never,
-        include: { shop: { select: { id: true, name: true, ownerName: true, primaryMobile: true, whatsappNumber: true } }, items: true, statusHistory: { orderBy: { createdAt: 'desc' } } },
+        include: { shop: { select: { id: true, name: true, ownerName: true, primaryMobile: true, whatsappNumber: true } }, items: true, statusHistory: { orderBy: { createdAt: 'desc' } }, deliveries: { include: { assignments: { include: { user: true } } } }, masterOrder: { include: { customer: { select: { name: true, mobile: true, email: true } } } } },
       });
       const total = await database.order.count({ where });
-      sendJson(response, 200, { items: orders, pagination: { page, pageSize, total, totalPages: Math.ceil(total / Math.max(pageSize, 1)) } });
+      const visibleOrders = context.roles.includes('CHILD_ADMIN')
+        ? orders.map(({ deliveries, ...order }) => ({
+          ...order,
+          deliveries: deliveries.map(({ assignments, ...delivery }) => ({
+            ...delivery,
+            assignments: assignments.map(({ user, ...assignment }) => ({
+              ...assignment,
+              user: { id: user.id, name: user.name, status: user.status },
+            })),
+          })),
+        }))
+        : orders;
+      sendJson(response, 200, { items: visibleOrders, pagination: { page, pageSize, total, totalPages: Math.ceil(total / Math.max(pageSize, 1)) } });
       return true;
     }
 
@@ -2244,5 +3157,3 @@ export const handleApi = async (request: IncomingMessage, response: ServerRespon
 
   throw new HttpError(404, 'API route not found');
 };
-
-

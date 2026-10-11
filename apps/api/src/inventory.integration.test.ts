@@ -36,8 +36,12 @@ test('database-backed concurrent marketplace checkout cannot oversell', async (t
   const vendorBUser = await prisma.user.findFirstOrThrow({ where: { email: 'vendor.b@farmmitra.test' } });
   const deliveryUser = await prisma.user.findFirstOrThrow({ where: { email: 'rahul.delivery@farmmitra.test' } });
   const admin = await prisma.user.findFirstOrThrow({ where: { email: 'admin.local@farmmitra.test' } });
-  const keys = ['phase3-concurrency-a', 'phase3-concurrency-b', 'phase3-out-of-stock-race', 'phase3-out-of-stock-after', 'phase3-untracked'];
+  const keys: [string, string, string, string, string] = ['phase3-concurrency-a', 'phase3-concurrency-b', 'phase3-out-of-stock-race', 'phase3-out-of-stock-after', 'phase3-untracked'];
+  const outOfStockKey = 'phase3-out-of-stock-checkout';
+  const untrackedCheckoutKey = 'phase3-untracked-checkout';
   await prisma.idempotencyKey.deleteMany({ where: { key: { in: keys } } });
+  await prisma.idempotencyKey.deleteMany({ where: { key: outOfStockKey } });
+  await prisma.idempotencyKey.deleteMany({ where: { key: untrackedCheckoutKey } });
   try {
     const ownInventory = responseFor();
     await handleApi({ ...requestFor('', vendorUser.id, ['VENDOR'], [], `/api/v1/marketplace/vendors/${vendor.id}/products`, {}), method: 'GET' } as never, ownInventory.response, prisma);
@@ -85,12 +89,12 @@ test('database-backed concurrent marketplace checkout cannot oversell', async (t
     assert.equal(Number((await prisma.product.findUniqueOrThrow({ where: { id: product.id } })).stockQuantity), 7);
     await prisma.product.update({ where: { id: product.id }, data: { stockQuantity: 0 } });
     const unavailable = responseFor();
-    try { await handleApi(checkoutRequest(keys[3], customer.id, address.id, product.id) as never, unavailable.response, prisma); } catch (error) { sendError(unavailable.response, error); }
+    try { await handleApi(checkoutRequest(outOfStockKey, customer.id, address.id, product.id) as never, unavailable.response, prisma); } catch (error) { sendError(unavailable.response, error); }
     assert.equal(unavailable.read().statusCode, 409);
     assert.equal(await prisma.stockMovement.count({ where: { productId: product.id, movementType: 'ORDER_DEDUCTION' } }), 1);
     await prisma.product.update({ where: { id: product.id }, data: { trackInventory: false, stockQuantity: 0 } });
     const untracked = responseFor();
-    try { await handleApi(checkoutRequest(keys[4], customer.id, address.id, product.id) as never, untracked.response, prisma); } catch (error) { sendError(untracked.response, error); }
+    try { await handleApi(checkoutRequest(untrackedCheckoutKey, customer.id, address.id, product.id) as never, untracked.response, prisma); } catch (error) { sendError(untracked.response, error); }
     assert.equal(untracked.read().statusCode, 201);
     assert.equal(await prisma.stockMovement.count({ where: { productId: product.id, movementType: 'ORDER_DEDUCTION' } }), 1);
     t.diagnostic(`concurrent results: ${results.map((result) => result.statusCode).join(', ')}`);
@@ -99,6 +103,8 @@ test('database-backed concurrent marketplace checkout cannot oversell', async (t
     await prisma.order.deleteMany({ where: { id: { in: orders.map((order) => order.id) } } });
     await prisma.masterOrder.deleteMany({ where: { id: { in: orders.flatMap((order) => order.masterOrderId ? [order.masterOrderId] : []) } } });
     await prisma.idempotencyKey.deleteMany({ where: { key: { in: keys } } });
+    await prisma.idempotencyKey.deleteMany({ where: { key: outOfStockKey } });
+    await prisma.idempotencyKey.deleteMany({ where: { key: untrackedCheckoutKey } });
     await prisma.stockMovement.deleteMany({ where: { productId: product.id } });
     await prisma.productPrice.delete({ where: { id: price.id } });
     await prisma.customerAddress.delete({ where: { id: address.id } });

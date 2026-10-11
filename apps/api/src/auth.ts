@@ -3,7 +3,7 @@ import jwt from 'jsonwebtoken';
 import { config } from '@farmmitra/config';
 import { PrismaClient } from '@farmmitra/database';
 
-export const ROLE_NAMES = ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'PACKING_STAFF', 'DELIVERY_STAFF', 'SHOP_OWNER', 'VENDOR', 'VENDOR_STAFF', 'VENDOR_ADMIN', 'DELIVERY_PARTNER', 'CUSTOMER'] as const;
+export const ROLE_NAMES = ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'CHILD_ADMIN', 'PACKING_STAFF', 'DELIVERY_STAFF', 'SHOP_OWNER', 'VENDOR', 'VENDOR_STAFF', 'VENDOR_ADMIN', 'DELIVERY_PARTNER', 'CUSTOMER'] as const;
 export type RoleName = (typeof ROLE_NAMES)[number];
 
 export const VENDOR_ROLE_NAMES = new Set(['VENDOR', 'VENDOR_STAFF', 'VENDOR_ADMIN']);
@@ -41,14 +41,20 @@ export const authenticate = async (request: RequestLike, database: PrismaClient)
 
   const user = await database.user.findUnique({
     where: { id: decoded.sub },
-    include: { roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } } },
+    include: {
+      roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } },
+      childAdminPermissions: { include: { permission: true } },
+    },
   });
   if (!user || user.status !== 'ACTIVE') throw new HttpError(401, 'User is inactive or unavailable');
 
+  const roles = user.roles.map(({ role }) => role.name);
   return {
     userId: user.id,
-    roles: user.roles.map(({ role }) => role.name),
-    permissions: user.roles.flatMap(({ role }) => role.permissions.map(({ permission }) => permission.name)),
+    roles,
+    permissions: roles.length === 1 && roles[0] === 'CHILD_ADMIN'
+      ? (user.childAdminPermissions ?? []).map(({ permission }) => permission.name)
+      : user.roles.flatMap(({ role }) => role.permissions.map(({ permission }) => permission.name)),
   };
 };
 

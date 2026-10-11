@@ -22,11 +22,13 @@ The API health endpoint is available at `http://localhost:4000/health`.
 
 Authentication endpoints:
 
-- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/register` is disabled for public customer enrollment; admins enroll customers through `/api/v1/users`.
 - `POST /api/v1/auth/login`
 - `GET /api/v1/auth/me` with `Authorization: Bearer <access-token>`
 
 Admin-ready resource groups are available under `/api/v1/users`, `/api/v1/shops`, and `/api/v1/catalog/{categories|units|products|variants|prices}`. Access is controlled by seeded permission names, not controller-specific role checks.
+
+The Shop supports login only for active customer accounts enrolled by an administrator. Public marketplace prices use each product's shop/vendor base rate; an authenticated customer sees an active customer-specific rate when one is configured. Administrators manage customer accounts and marketplace pricing in the Admin portal.
 
 ## Inventory and warehouse extension
 

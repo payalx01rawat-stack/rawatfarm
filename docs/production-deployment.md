@@ -64,6 +64,16 @@ Create a separate environment file on the EC2 host. Do not copy the local `.env`
 
 The API's actual required startup values are `DATABASE_URL`, `REDIS_URL`, and `JWT_SECRET`; the remaining values have schema defaults or are optional. `PORT` is not an application variable in this repository. Use `API_PORT`.
 
+### Production configuration
+
+Production startup requires `DATABASE_URL`, `REDIS_URL`, and `JWT_SECRET` (at least 32 characters). `REDIS_URL` is required by shared configuration validation, but the API request path does not connect to Redis; the current rate limiter is process-local. Keep the API on a single process/instance or introduce a shared limiter before horizontally scaling it.
+
+Production also requires explicit `API_BASE_URL` and `NEXT_PUBLIC_API_BASE_URL` HTTPS origins plus `CORS_ALLOWED_ORIGINS` containing only exact HTTPS frontend origins. The local defaults are rejected when `NODE_ENV=production`. Never put credentials in frontend URLs or commit real environment values.
+
+The request body defaults to 1 MiB. Rate limits default to 300 API requests, 20 authentication requests, and 60 payment requests per client per 60-second window. Tune `MAX_REQUEST_BODY_BYTES`, `RATE_LIMIT_WINDOW_MS`, `API_RATE_LIMIT_MAX`, `AUTH_RATE_LIMIT_MAX`, and `PAYMENT_RATE_LIMIT_MAX` for the deployment. `TRUST_PROXY` defaults to `false`; set it to `true` only when the API is reachable exclusively through a trusted proxy that overwrites forwarded client-address headers.
+
+For production database changes, use the checked-in migrations with `npm.cmd run db:migrate:deploy`. This invokes `prisma migrate deploy`; do not use the development `db:migrate` command in production. This runbook does not execute migrations against any environment.
+
 ### Frontend environment
 
 The local shop and admin/vendor Next.js applications should use environment files that are not committed:

@@ -7,6 +7,7 @@
                     "dev":  "tsx watch src/server.ts",
                     "build":  "tsc --outDir dist --noEmit false",
                     "test":  "tsx --test src/*.test.ts",
+                    "test:payment-concurrency":  "tsx --test src/payment-concurrency.integration.test.ts",
                     "start":  "tsx src/server.ts"
                 },
     "dependencies":  {

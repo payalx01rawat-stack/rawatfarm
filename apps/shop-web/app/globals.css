@@ -14,6 +14,18 @@ body {
   color: #172018;
 }
 
+.fm-language-dock {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  z-index: 1000;
+  padding: 5px 8px;
+  border: 1px solid #dfe7df;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 4px 14px #17201818;
+}
+
 button,
 input {
   font: inherit;
@@ -368,6 +380,8 @@ button:hover {
 .status-badge { display: inline-block; padding: 5px 8px; border-radius: 99px; background: #e8eee3; color: #466043; font-size: 10px; font-weight: 800; text-transform: uppercase; }
 .status-badge.warn { background: #fff0d5; color: #95651d; }
 .portal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.portal-grid .section-heading .market-kicker,
+.portal-grid .portal-panel > h3:last-of-type + p.muted { display: none; }
 .portal-form { display: grid; gap: 12px; }
 .portal-form label { color: #617064; font-size: 12px; }
 .portal-form input, .portal-form select, .portal-form textarea { margin-top: 6px; padding: 11px; border: 1px solid #ded8ca; border-radius: 6px; background: white; }
@@ -506,9 +520,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .payment-history { display: grid; gap: 8px; padding: 0; list-style: none; }
 .payment-history li { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid #eee9df; font-size: 12px; }
 .payment-history li:last-child { border-bottom: 0; }
-.market-nav { display: flex; align-items: center; gap: 10px; }
+.market-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .market-link { margin: 0; padding: 9px 10px; background: transparent; color: #617064; font-size: 12px; }
 .market-link:hover { background: #f0eadf; color: #1c2a20; }
+.market-create { margin: 0; padding: 9px 12px; border: 1px solid #e75d35; border-radius: 6px; background: #e75d35; color: white; font-size: 12px; white-space: nowrap; }
+.market-create:hover { background: #cf4d2a; }
+.market-greeting { color: #1c2a20; font-size: 12px; font-weight: 700; }
+.auth-switch { margin: 20px 0 0; color: #738074; font-size: 13px; text-align: center; }
+.auth-switch a { color: #1f6b3a; font-weight: 700; text-decoration: none; }
+.auth-switch a:hover { text-decoration: underline; }
 .cart-browse { margin: 0; padding: 8px 10px; background: transparent; border: 1px solid #657268; color: #d7dfd3; font-size: 12px; }
 .product-detail-copy h2 { margin-bottom: 10px; font: 400 38px Georgia, serif; }
 .product-detail-description { max-width: 540px; color: #657166; line-height: 1.65; }

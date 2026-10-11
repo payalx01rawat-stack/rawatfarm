@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react"
 import { useParams } from "next/navigation"
 import { PortalShell, StateMessage } from "../../components/PortalShell"
-import { api } from "../../lib/api"
+import { customerApi } from "../../lib/customer-api"
 import { isPaymentCollected } from "../../lib/payment"
 
 type Payment = { status: string; method: string; amount?: string | number; referenceNumber?: string | null; receivedAt?: string | null }
@@ -21,7 +21,10 @@ export default function OrderDetail() {
 
 	async function loadOrder() {
 		setError("")
-		try { setOrder(await api<Master>(`/api/v1/marketplace/master-orders/${params.id}`)) }
+		try {
+			const nextOrder = await customerApi<Master>(`/api/v1/marketplace/master-orders/${params.id}`)
+			setOrder({ ...nextOrder, subOrders: nextOrder.subOrders.map((subOrder) => ({ ...subOrder, vendor: subOrder.vendor ? { ...subOrder.vendor, name: "Rawat Farm" } : null })) })
+		}
 		catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to load order") }
 	}
 

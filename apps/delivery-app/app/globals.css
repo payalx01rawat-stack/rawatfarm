@@ -1,6 +1,7 @@
 * { box-sizing: border-box; }
 :root { color-scheme: light; --ink: #17231b; --muted: #718076; --paper: #f6f8f3; --card: #fff; --line: #dfe7dd; --green: #1f6b3a; --orange: #e7663c; --yellow: #fff0ce; }
 html, body { margin: 0; min-height: 100%; overflow-x: hidden; font-family: Georgia, "Times New Roman", serif; background: var(--paper); color: var(--ink); }
+.fm-language-dock { position: fixed; top: 10px; right: 12px; z-index: 1000; padding: 5px 8px; border: 1px solid var(--line); border-radius: 10px; background: #fff; box-shadow: 0 4px 14px #17231b18; }
 button, input, select { font: inherit; }
 button { border: 0; border-radius: 10px; padding: 13px 16px; background: var(--green); color: white; cursor: pointer; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; }
 button:disabled { opacity: .55; cursor: not-allowed; }

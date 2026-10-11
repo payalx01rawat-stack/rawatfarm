@@ -13,3 +13,12 @@ packages/database/generated/client/
 .DS_Store
 Thumbs.db
 .idea/
+
+# Local database backups
+backups/
+
+# Generated TypeScript build information
+*.tsbuildinfo
+
+# Build output in any workspace
+**/dist/
