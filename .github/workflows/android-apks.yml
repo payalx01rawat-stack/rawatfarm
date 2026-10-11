@@ -1,0 +1,76 @@
+﻿name: FarmMitra Android APKs
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }} APK
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: shop-web
+            label: Shop
+            artifact: farmmitra-shop-apk
+          - app: admin-web
+            label: Admin
+            artifact: farmmitra-admin-apk
+          - app: delivery-app
+            label: Delivery
+            artifact: farmmitra-delivery-apk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Android project
+        working-directory: apps/${{ matrix.app }}
+        env:
+          FARMMITRA_SHOP_URL: ${{ secrets.FARMMITRA_SHOP_URL }}
+          FARMMITRA_ADMIN_URL: ${{ secrets.FARMMITRA_ADMIN_URL }}
+          FARMMITRA_DELIVERY_URL: ${{ secrets.FARMMITRA_DELIVERY_URL }}
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        working-directory: apps/${{ matrix.app }}
+        env:
+          FARMMITRA_SHOP_URL: ${{ secrets.FARMMITRA_SHOP_URL }}
+          FARMMITRA_ADMIN_URL: ${{ secrets.FARMMITRA_ADMIN_URL }}
+          FARMMITRA_DELIVERY_URL: ${{ secrets.FARMMITRA_DELIVERY_URL }}
+        run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: apps/${{ matrix.app }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: apps/${{ matrix.app }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
